@@ -1,0 +1,6 @@
+/target/
+/local/
+__pycache__/
+*.onnx
+*.onnx.data
+*.npy
