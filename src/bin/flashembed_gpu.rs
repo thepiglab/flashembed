@@ -96,6 +96,10 @@ struct Args {
     /// write embeddings.* (default) or <tag>.* file names
     #[arg(long, default_value = "embeddings")]
     tag: String,
+    /// narrow-precision layer GEMMs (with --dtype bf16): none, fp8 (MXFP8: E4M3 + UE8M0 scale per 32 values) or
+    /// nvfp4 (E2M1 + UE4M3 scale per 16 values); attention, norms and the residual stream are unchanged
+    #[arg(long, default_value = "none")]
+    quant: String,
     /// preprocessing only (no GPU): time the producer thread alone
     #[arg(long)]
     prep_only: bool,
@@ -202,7 +206,8 @@ fn run(a: Args) -> Result<()> {
     }
     let t_load = Instant::now();
     let vision = a.model == Model::Gemma && a.modality == Modality::Image;
-    let mut eng = Engine::load(&a.snapshot, arch, dtype, vision, max_tokens, max_patches, a.img_mb << 20)?;
+    let quant = match a.quant.as_str() { "none" => 0, "fp8" => 1, "nvfp4" => 2, q => bail!("--quant {q}: none|fp8|nvfp4") };
+    let mut eng = Engine::load(&a.snapshot, arch, dtype, vision, max_tokens, max_patches, a.img_mb << 20, quant)?;
     let load_s = t_load.elapsed().as_secs_f64();
     let mem_loaded = eng.mem()?;
     let out_dim = eng.out_dim;
@@ -300,7 +305,7 @@ fn run(a: Args) -> Result<()> {
         "gpu_weights_mb": mem.weights as f64 / 1048576.0, "gpu_arena_mb": mem.arena as f64 / 1048576.0,
         "gpu_device_used_mb": mem.device_used as f64 / 1048576.0, "gpu_device_used_after_load_mb": mem_loaded.device_used as f64 / 1048576.0,
         "device": gpu::device_name(), "host": std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim(),
-        "job": std::env::var("SLURM_JOB_ID").ok(), "side": a.side, "no_late": a.no_late, "dim": a.dim,
+        "job": std::env::var("SLURM_JOB_ID").ok(), "side": a.side, "no_late": a.no_late, "dim": a.dim, "quant": a.quant,
     });
     std::fs::write(a.out.join(format!("{}.json", a.tag)), serde_json::to_string_pretty(&res)?)?;
     println!("{res}");

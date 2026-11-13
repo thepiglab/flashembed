@@ -42,6 +42,20 @@ the same inputs, nodes and CPUs, over 353 cases measured on both runtimes, on th
 
 (median speed over the cases in each group)
 
+## GPU runner
+
+`flashembed-gpu` (cargo feature `cuda`) is a native CUDA engine for the same two models, text and images. Its fused
+kernels include FlashAttention-style tensor-core attention for bf16 and 3xTF32 for fp32, and GEMMs run on cuBLAS.
+Inputs are packed sequences with no padding. It produces the same vectors as the model-card runtimes on GPU:
+cos >= 0.99999998 in fp32. Compared with them:
+
+- **NVIDIA B200**: 8-9x faster for bf16 text and 5x for images, at 1/5-1/30 of the memory.
+- **RTX PRO 6000 Blackwell**: 6-7x faster for bf16 text and 5x for images.
+- **fp32**: 2-5x faster on both GPUs.
+
+It also beats ONNX Runtime's CUDA and TensorRT execution providers on the same graphs. Details, design and
+measurements are in [docs/GPU.md](docs/GPU.md).
+
 ## What was profiled
 
 All in [docs/PROFILING.md](docs/PROFILING.md), with the method and hardware:
@@ -140,6 +154,7 @@ anything, and `flashembed_sbatch` (a drop-in for `sbatch`) refuses to submit it.
 | path | what |
 |---|---|
 | `src/main.rs` | CLI (`embed`, `bench`), ONNX Runtime sessions, thread-pool autotune, batching, pooling |
+| `cuda/fegpu.cu`, `src/gpu.rs`, `src/bin/flashembed_gpu.rs` | GPU runner: CUDA engine, Rust bindings + weight loading, CLI ([docs/GPU.md](docs/GPU.md)) |
 | `src/flash.rs` | custom ops: FlashAttention, AudioChunkAttention, ChannelLayerNorm |
 | `src/prep.rs`, `src/pil_resize.rs` | tokenization, EmbeddingGemma 2 / NeoMME image preprocessing, Pillow/ATen-exact resize |
 | `src/media.rs` | FFmpeg audio/video decoding, Gemma 4 log-mel features, video frame sampling |

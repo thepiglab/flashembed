@@ -15,13 +15,88 @@ batch size (64 or 256 texts, 16 or 64 images) is shown. "x" is flashembed-gpu / 
 Memory is what each runtime's allocator holds: torch's peak reserved memory, and flashembed-gpu's weights +
 activation arena + cuBLAS workspace. The CUDA context comes on top for both.
 
-RESULTS_TABLES
+#### NVIDIA B200 (183 GB, sm_100)
+
+| case | reference items/s (memory) | flashembed-gpu items/s (memory) | x | low-memory mode items/s (memory) | x |
+|---|---|---|---|---|---|
+| EmbeddingGemma 2 text, bf16 | 391 (49.8 GB) | **3,156** (1.6 GB) | **8.1** | 2,293 (0.86 GB) | 5.9 |
+| NeoMME text, bf16 | 436 (17.4 GB) | **3,961** (1.9 GB) | **9.1** | 2,887 (0.93 GB) | 6.6 |
+| EmbeddingGemma 2 images, bf16 | 66 (8.6 GB) | **366** (3.6 GB) | **5.5** | 273 (1.6 GB) | 4.1 |
+| NeoMME images, bf16 | 179 (10.0 GB) | **877** (2.2 GB) | **4.9** | 765 (1.0 GB) | 4.3 |
+| EmbeddingGemma 2 text, fp32 | 163 (13.6 GB) | **511** (2.7 GB) | **3.1** | 452 (1.3 GB) | 2.8 |
+| NeoMME text, fp32 | 150 (7.4 GB) | **734** (3.2 GB) | **4.9** | 705 (1.5 GB) | 4.7 |
+| EmbeddingGemma 2 images, fp32 | 29 (14.2 GB) | **74** (6.1 GB) | **2.5** | 67 (2.6 GB) | 2.3 |
+| NeoMME images, fp32 | 112 (4.3 GB) | **503** (3.7 GB) | **4.5** | 430 (1.6 GB) | 3.8 |
+
+#### NVIDIA RTX PRO 6000 Blackwell Server Edition (96 GB, sm_120)
+
+| case | reference items/s (memory) | flashembed-gpu items/s (memory) | x |
+|---|---|---|---|
+| EmbeddingGemma 2 text, bf16 | 226 (12.9 GB) | **1,508** (0.86 GB) | **6.7** |
+| NeoMME text, bf16 | 296 (4.8 GB) | **1,736** (0.93 GB) | **5.9** |
+| EmbeddingGemma 2 images, bf16 | 45 (8.6 GB) | **206** (3.6 GB) | **4.6** |
+| NeoMME images, bf16 | 180 (2.7 GB) | **967** (2.2 GB) | **5.4** |
+| EmbeddingGemma 2 text, fp32 | 128 (13.6 GB) | **319** (2.7 GB) | **2.5** |
+| NeoMME text, fp32 | 130 (7.4 GB) | **351** (1.5 GB) | **2.7** |
+| EmbeddingGemma 2 images, fp32 | 25 (4.6 GB) | **43** (6.1 GB) / 41 (2.6 GB) | **1.7** |
+| NeoMME images, fp32 | 111 (4.3 GB) | **246** (1.6 GB) | **2.2** |
+
+Notes:
+
+- **Reference column.** It is the faster of the two batch sizes measured, at that batch's memory. At its smallest
+  batch the reference needs less memory, but it is also slower: EmbeddingGemma 2 images in fp32 on the B200 run at
+  27.8 items/s in 4.6 GB at batch 16. flashembed-gpu's low-memory mode needs less memory than even the reference's
+  smallest batch in every case (for example 2.6 vs 4.6 GB there, 0.86 vs 12.9 GB for EmbeddingGemma 2 text bf16), and
+  it is still 2.3-6.6x faster than the reference's best.
+- **Budgets.** Default budgets are `--max-tokens` 32,768 on B200-class GPUs and 8,192 elsewhere. Images use
+  40,320 patches (EmbeddingGemma 2) and 16,384 (NeoMME). Low-memory mode is `--max-tokens 8192`, plus
+  `--max-patches 10080 --img-mb 32` (EmbeddingGemma 2 images) or `--max-patches 4096` (NeoMME images). On the
+  RTX PRO 6000 the 8,192-token budget is as fast as or faster than larger ones for text, so it is the default
+  there, and the table shows the faster setting per row.
+- **CPUs.** The reference had 4 CPUs on the B200 and 3 on the RTX PRO 6000; flashembed-gpu had 3 on both. On the
+  B200, the NeoMME image path is limited by JPEG decoding on those 3 CPUs; the GPU alone does about 2,700 images/s.
+- **Full context.** At 8,192 / 16,384 tokens (the 250 longest texts), the reference needs 13.6 GB (EmbeddingGemma 2)
+  and 56.7 GB (NeoMME) reserved at batch 8 in FP32. flashembed-gpu holds 2.7 / 3.2 GB at any length up to its token
+  budget, because memory depends on the token budget, not on the longest item.
+
+### Other GPU runtimes on the same graphs
+
+ONNX Runtime 1.31.1 (`onnxruntime-gpu`, CUDA 13 build) on the stock-attention ONNX graphs (`py/export_onnx.py
+--attn sdpa`, the CPU runner's export without the custom ops), batch 64, the same 4,000 texts
+(`py/ort_cuda_bench.py`):
+
+| GPU | runtime | EmbeddingGemma 2 items/s (min cos vs reference fp32, peak device memory) | NeoMME items/s (min cos, memory) |
+|---|---|---|---|
+| B200 | ORT CUDA EP, fp32 | fails: the wheel ships sm_75-sm_90a and sm_120a kernels but none for sm_100 and no PTX | fails |
+| B200 | ORT TensorRT EP 10.16, fp32 (TF32 inside TensorRT) | 364 (0.999998, 10.9 GB) | engine build fails (no implementation for a masked-fill node) |
+| B200 | ORT TensorRT EP 10.16, bf16 | 462 (**0.952**, 1,936 items < 0.999, 7.2 GB) | 470 (**0.951**, 1,678 items < 0.999, 10.0 GB) |
+| B200 | **flashembed-gpu fp32 / bf16** | **511 / 3,156** (1.0 / 0.99990, 1.6-2.7 GB) | **734 / 3,961** (1.0 / 0.99993, 1.9-3.2 GB) |
+| RTX PRO 6000 | ORT CUDA EP, fp32 | 148 (0.999999, 28.9 GB) | 125 (0.999999, 43.4 GB) |
+| RTX PRO 6000 | ORT TensorRT EP 10.16, fp32 | 237 (0.999998, 10.5 GB) | engine build fails |
+| RTX PRO 6000 | ORT TensorRT EP 10.16, bf16 | 351 (**0.952**, 6.7 GB) | 326 (**0.951**, 9.6 GB) |
+| RTX PRO 6000 | **flashembed-gpu fp32 / bf16** | **319 / 1,508** (1.0 / 0.99992, 0.9-2.7 GB) | **351 / 1,736** (1.0 / 0.99993, 0.9-1.5 GB) |
+
+Peak device memory for ONNX Runtime is NVML's device-wide use (CUDA context included) sampled during the run.
+The TensorRT engines are built once per shape profile (batch 1-64, 2-1,024 tokens) and cached; build time (20-90 s)
+is not counted. TensorRT's bf16 engines lose most of the parity. The likely cause is that the whole network,
+softmax and RMSNorm reductions included, runs in bf16 (not verified layer by layer). flashembed-gpu keeps those
+in FP32.
+
+
 
 ### Parity
 
 Per-item cosine to the reference's **FP32** vectors on the same GPU, minimum over all items (`py/gpu_compare.py`):
 
-PARITY_TABLE
+| case | B200 fp32 | B200 bf16 | RTX PRO 6000 fp32 | RTX PRO 6000 bf16 | reference bf16 vs reference fp32 |
+|---|---|---|---|---|---|
+| EmbeddingGemma 2 text (4,000) | 0.99999999999 | 0.99990 | 0.99999999995 | 0.99992 | 0.99968 |
+| NeoMME text (4,000) | 0.9999999999 | 0.99993 | 0.9999999999 | 0.99993 | 0.99941 |
+| EmbeddingGemma 2 images (400) | 0.999999985 | 0.99856 (1 < 0.999) | 0.999999987 | 0.99858 (1 < 0.999) | 0.99893 (1 < 0.999) |
+| NeoMME images (400) | 0.9999999998 | 0.99981 | 0.9999999998 | 0.99981 | 0.99955 |
+| EmbeddingGemma 2 text, 250 longest at 8,192 tokens | 0.9999999998 | 0.99998 | | | |
+| NeoMME text, 250 longest at 16,384 tokens | 0.999999995 | 0.99999 | | | |
+| NeoMME late vectors, 434,475 token rows at 16,384 tokens | 0.9999997 | 0.972 (median 0.99996) | | | 0.813 (median 0.99978) |
 
 - FP32 is FP32-exact in practice: 1 - cos <= 2e-8 everywhere. The FP32 GEMMs use cuBLAS's BF16x9 emulation (B200)
   or SGEMM (RTX PRO 6000); attention uses 3xTF32 tensor-core MMAs. Against the CPU runner's vectors (computed at the
@@ -32,6 +107,62 @@ PARITY_TABLE
 - GPU image preprocessing gives the same pixels as CPU preprocessing: the vectors are bit-identical in both
   precisions (`--img-mb 0` vs default, same batches).
 
+
+### GPU utilisation and concurrency
+
+On a B200 with 3 CPUs, the inputs were repeated to 20,000 texts and 2,000 figures. NVML was sampled every 100 ms
+(`nvidia-smi` "utilization.gpu" is the share of time any kernel runs). Several flashembed-gpu processes then shared
+the one GPU:
+
+| case | 1 process: items/s (GPU busy) | 2 processes: total items/s | 4 processes: total items/s | reference alone: items/s (GPU busy) |
+|---|---|---|---|---|
+| EmbeddingGemma 2 text, bf16 | 2,834 (72 %) | 2,733 (93 %) | 2,822 (95 %) | 329 (55 %) |
+| NeoMME text, bf16 | 3,625 (78 %) | 3,471 (93 %) | 3,487 (95 %) | 344 (61 %) |
+| EmbeddingGemma 2 images, bf16 | 329 (69 %) | 325 (89 %) | 336 (93 %) | 58 (41 %) |
+| NeoMME images, bf16 | 510 (20 %) | 608 (25 %) | 629 (26 %) | 103 (15 %) |
+| EmbeddingGemma 2 text, fp32 | 507 (98 %) | 441 (99 %) | 441 (99 %) | |
+
+- **One process is enough.** A second or fourth process raises the busy figure but not the throughput, so a single
+  flashembed-gpu process uses the GPU fully. The one exception is NeoMME figures, which are bound by JPEG decoding on
+  3 CPUs: the GPU is 80 % idle, and more processes or more CPUs per GPU are the lever there.
+- **The reference leaves the GPU 39-85 % idle** at its batch 64 / 16, waiting on Python-side tokenization,
+  preprocessing and kernel launches.
+- Memory grows linearly with processes (2.3-4.4 GB each), so packing several workers on one GPU buys nothing for text.
+
+### Narrow-precision GEMMs (`--quant fp8|nvfp4`)
+
+`--quant` runs every layer GEMM in a block-scaled narrow format on cuBLASLt. Embeddings, patch stems, output heads,
+attention, norms and the residual stream stay as in bf16 mode. The formats are:
+
+- MXFP8: E4M3 values with one UE8M0 scale per 32 values.
+- NVFP4: E2M1 values with one UE4M3 scale per 16 values, plus a per-tensor pre-scale on the weights.
+
+Weights are quantised once at load. Activations are quantised per block by a small kernel before each GEMM, with the
+scale rounding of the cuBLAS docs ("1D Block Scaling", tiled scale-factor layout).
+
+| GPU | case | bf16 items/s | MXFP8 items/s (median / min cos vs reference fp32) | NVFP4 items/s (median / min cos) |
+|---|---|---|---|---|
+| B200 | EmbeddingGemma 2 text | 3,162 | 3,042 (0.9983 / 0.987) | 2,364 (0.979 / 0.940) |
+| B200 | NeoMME text | 3,961 | 4,149 (0.9977 / 0.985) | 3,472 (0.969 / 0.904) |
+| B200 | EmbeddingGemma 2 images | 358 | 366 (0.9980 / 0.987) | 314 (0.980 / 0.944) |
+| B200 | NeoMME images | 700 | 722 (0.9956 / 0.978) | 786 (0.938 / 0.832) |
+| RTX PRO 6000 | EmbeddingGemma 2 text | 1,404 | 1,538 (0.9983 / 0.991) | 1,502 (0.979 / 0.936) |
+| RTX PRO 6000 | NeoMME text | 1,676 | 2,076 (0.9977 / 0.985) | 2,189 (0.969 / 0.904) |
+| RTX PRO 6000 | EmbeddingGemma 2 images | 203 | 229 (0.9981 / 0.988) | 247 (0.980 / 0.948) |
+| RTX PRO 6000 | NeoMME images | 806 | 881 (0.9956 / 0.978) | 909 (0.938 / 0.832) |
+
+For reference, bf16 is at median 0.99999, min 0.9986-0.9999.
+
+- **Not worth it for these models.** GEMMs are only 25-30 % of the bf16 kernel time on the B200 and about half on
+  the RTX PRO 6000. Halving or quartering them gives at most +5 % (B200) or +9-31 % (RTX PRO 6000) end to end, and on
+  the B200 the activation-quantisation pass eats most of that.
+- **Parity falls below the 0.999 bar.** MXFP8 lands at a median cosine of 0.996-0.998 to the FP32 vectors (all
+  4,000 texts below 0.999). NVFP4 lands at 0.94-0.98. That is a 100-1000x larger error than bf16 mode, for embeddings
+  that will be compared by cosine.
+- **Kept as an option, not a default.** The remaining headroom is in fusing the activation quantisation into the
+  producing kernels (one pass fewer). That cannot fix the parity.
+- **INT8 was not built.** On these GPUs INT8 tensor-core throughput is the same as FP8, and cuBLASLt offers only
+  tensor-wide scaling for INT8 (no block scaling), so it would be no faster than MXFP8 and less accurate.
 
 ## Build and run
 
@@ -46,8 +177,9 @@ Options: `--dtype bf16|fp32`, `--max-tokens` (tokens per forward, default 32768;
 `--max-patches` (image patches per forward), `--max-items`, `--max-len`, `--side document|query` (NeoMME), `--no-late`,
 `--dim` (EmbeddingGemma 2 Matryoshka size), `--warmup`, `--prep-only` (time the CPU preprocessing alone).
 Output files are the same as `flashembed embed`'s, plus `embeddings.json` with throughput and GPU memory.
-Environment: `FLASHEMBED_ATTN=simt` forces the FP32-math attention kernel in bf16 mode; `FLASHEMBED_FP32_GEMM=emu`
-runs FP32 GEMMs through cuBLAS's BF16x9 FP32 emulation (see below).
+Environment: `FLASHEMBED_ATTN=simt` forces the plain SIMT attention kernels; `FLASHEMBED_FP32_GEMM=sgemm` runs FP32
+GEMMs as plain SGEMM instead of cuBLAS's BF16x9 FP32 emulation (see Precision); `--quant fp8|nvfp4` is described
+above.
 
 Scope: text and images for both models (EmbeddingGemma 2 at the default 280 soft tokens per image). Audio and
 video stay on the CPU runner for now. Video would need the vision tower at 140 tokens per frame; audio would need
@@ -104,7 +236,10 @@ are concatenated at load time: QKV (+ NeoMME's output gate) and gate|up, so each
   - BF16: tensor cores (`mma.sync.m16n8k16`, FP32 accumulate), 64 query rows x 32-64 keys per tile, K/V tiles
     double-buffered with `cp.async` when shared memory allows. Head dim 512 (EmbeddingGemma 2's global layers) runs as
     two 256-wide output halves, which keeps the accumulator in registers.
-  - FP32: SIMT kernel with the same tiling logic and FP32 math throughout.
+  - FP32: the same tiling on tensor cores with 3xTF32: each FP32 operand is split into a TF32 high part and a TF32
+    remainder, and three `mma.sync.m16n8k8` products accumulate in FP32. The dropped low x low term is ~2^-22
+    relative, so the parity is FP32-level (min cos >= 0.99999998 vs torch FP32). This is 1.3-1.8x faster end to end
+    than the SIMT kernel it replaced, which remains as `FLASHEMBED_ATTN=simt`.
 - **Pooling**: masked mean over each packed sequence and L2 normalisation on the GPU. EmbeddingGemma 2's 512 -> 768
   projection is applied after pooling (it is linear, so this equals projecting every token first) in FP32.
   NeoMME's late-interaction head is one GEMM plus a row-normalisation kernel.
@@ -135,8 +270,9 @@ are concatenated at load time: QKV (+ NeoMME's output gate) and gate|up, so each
   and peak device memory is weights + arena + cuBLAS workspace, known before the first batch.
 - **Overlap.** A preprocessing thread (tokenization, image decoding, rayon-parallel within a batch) prepares batch n+1
   while the GPU runs batch n. Inputs go through one pinned staging buffer and a single async copy per batch.
-- **No CUDA graphs.** Every batch has a different packed shape, and at a 32k-token budget a forward is milliseconds
-  of GPU work against roughly 300 launches, so launch overhead is a small share.
+- **No CUDA graphs.** Every batch has a different packed shape, and at a 32k-token budget a forward is tens of
+  milliseconds of GPU work against roughly 300 launches. The concurrency test below shows no idle GPU capacity for
+  graphs to recover.
 
 ### Image preprocessing on the GPU
 

@@ -113,7 +113,9 @@ fn for_tensors(path: &Path, keep: &dyn Fn(&str) -> bool, f: &mut dyn FnMut(&str,
 impl Engine {
     /// Load a model from its HF snapshot. `vision`: also build EmbeddingGemma 2's vision tower.
     /// `img_bytes` > 0: GPU image preprocessing (EmbeddingGemma 2) with this many bytes of decoded images per batch.
-    pub fn load(snapshot: &Path, arch: Arch, dtype: Dtype, vision: bool, max_tokens: usize, max_patches: usize, img_bytes: usize) -> Result<Self> {
+    /// `quant`: 0 = off, 1 = MXFP8, 2 = NVFP4 for the layer GEMMs (bf16 only).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(snapshot: &Path, arch: Arch, dtype: Dtype, vision: bool, max_tokens: usize, max_patches: usize, img_bytes: usize, quant: u32) -> Result<Self> {
         let cfg: Value = serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json"))?)?;
         let h = unsafe {
             fe_new(match arch { Arch::Gemma => 0, Arch::Neomme => 1 }, match dtype { Dtype::F32 => 0, Dtype::Bf16 => 1 }, 0)
@@ -126,6 +128,7 @@ impl Engine {
             let c = CString::new(k)?;
             ck(unsafe { fe_cfg(h, c.as_ptr(), v) })
         };
+        set("quant", quant as f64)?;
         let num = |v: &Value, k: &str| -> Result<f64> { v[k].as_f64().with_context(|| format!("config: {k}")) };
         match arch {
             Arch::Gemma => {

@@ -11,6 +11,9 @@
 //    NeoMME's exclusive-attention + sigmoid gate as epilogue); BF16 runs on tensor cores (mma.sync m16n8k16);
 //  * all activation buffers come from one arena sized at build time (no allocation while running).
 #include <cublas_v2.h>
+#include <cublasLt.h>
+#include <cuda_fp4.h>
+#include <cuda_fp8.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -152,6 +155,75 @@ __global__ void k_resid_norm(int n, float eps, const T* __restrict__ x, int x_mo
     if (y) y[row * n + c] = fromf<T>(o);
     if (y32) y32[row * n + c] = o;
   }
+}
+
+// ---- block-scaled quantization for cuBLASLt narrow-precision GEMMs (FMT 1: MXFP8 = E4M3 values + UE8M0 scale per
+// 32 K-elements; FMT 2: NVFP4 = E2M1 values (two per byte, lower K index in the low nibble) + UE4M3 scale per 16).
+// Scales use cuBLASLt's tiled layout: 128 (outer) x 4 (scale columns) tiles of 512 bytes, row-major over tiles,
+// inside a tile offset = (outer % 32) * 16 + (outer % 128 / 32) * 4 + inner % 4 (cuBLAS docs, "1D Block Scaling
+// Factors Layout"). Scale rounding follows the docs' "Computing scaling and conversion factors" steps.
+__device__ __forceinline__ size_t sf_offset(int outer, int kb, int sfk_pad) {
+  return ((size_t)(outer / 128) * (sfk_pad / 4) + kb / 4) * 512 + (outer % 32) * 16 + ((outer % 128) / 32) * 4 + (kb % 4);
+}
+template <int FMT>
+__global__ void k_quant_blocks(const bf16* __restrict__ x, int rows, int K, float gscale, uint8_t* __restrict__ q,
+                               uint8_t* __restrict__ sf, int sfk_pad) {
+  constexpr int BLK = FMT == 1 ? 32 : 16;
+  const int nb = K / BLK;
+  const long long total = (long long)rows * nb;
+  for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < total; i += (long long)gridDim.x * blockDim.x) {
+    const int r = (int)(i / nb), b = (int)(i % nb);
+    const bf16* p = x + (size_t)r * K + (size_t)b * BLK;
+    float v[BLK];
+    float amax = 0.f;
+#pragma unroll
+    for (int j = 0; j < BLK; j += 8) {
+      const uint4 u = *(const uint4*)(p + j);
+      const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        v[j + 2 * t] = __low2float(h2[t]) * gscale;
+        v[j + 2 * t + 1] = __high2float(h2[t]) * gscale;
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < BLK; ++j) amax = fmaxf(amax, fabsf(v[j]));
+    uint8_t sbyte;
+    float R;
+    if (FMT == 1) {
+      int e = 0;
+      const float m = frexpf(amax / 448.f, &e);  // S = m * 2^e, m in [0.5, 1)
+      int E = amax > 0.f ? (m == 0.5f ? e - 1 : e) : 0;  // round the exponent up unless S is a power of two
+      E = max(-127, min(127, E));
+      sbyte = (uint8_t)(E + 127);
+      R = exp2f((float)-E);
+      uint8_t* o = q + (size_t)r * K + (size_t)b * BLK;
+#pragma unroll
+      for (int j = 0; j < BLK; j += 16) {
+        uint8_t tmp[16];
+#pragma unroll
+        for (int t = 0; t < 16; ++t) tmp[t] = __nv_cvt_float_to_fp8(v[j + t] * R, __NV_SATFINITE, __NV_E4M3);
+        *(uint4*)(o + j) = *(const uint4*)tmp;
+      }
+    } else {
+      sbyte = __nv_cvt_float_to_fp8(amax / 6.f, __NV_SATFINITE, __NV_E4M3);
+      const float sq = __half2float(__half(__nv_cvt_fp8_to_halfraw(sbyte, __NV_E4M3)));
+      R = sq > 0.f ? 1.f / sq : 0.f;
+      uint8_t tmp[8];
+#pragma unroll
+      for (int t = 0; t < 8; ++t)
+        tmp[t] = __nv_cvt_float2_to_fp4x2(make_float2(v[2 * t] * R, v[2 * t + 1] * R), __NV_E2M1, cudaRoundNearest);
+      *(uint2*)(q + ((size_t)r * K + (size_t)b * BLK) / 2) = *(const uint2*)tmp;
+    }
+    sf[sf_offset(r, b, sfk_pad)] = sbyte;
+  }
+}
+__global__ void k_amax_bf16(const bf16* __restrict__ x, size_t n, unsigned* __restrict__ out) {
+  float a = 0.f;
+  for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+    a = fmaxf(a, fabsf(__bfloat162float(x[i])));
+  a = warp_max(a);
+  if ((threadIdx.x & 31) == 0) atomicMax(out, __float_as_uint(a));  // non-negative floats order like their bits
 }
 
 // ---- vectorised row helpers: 4 consecutive elements per access
@@ -1391,6 +1463,12 @@ struct DBuf {
 struct Lin {  // weight [n, k] row-major in the compute dtype
   void* w = nullptr;
   int n = 0, k = 0;
+  // block-scaled narrow-precision copy (--quant fp8 / nvfp4): data [n, k] (fp8 bytes or packed fp4), scales in
+  // cuBLASLt's tiled layout, alpha = 1 / per-tensor pre-scale
+  void* wq = nullptr;
+  uint8_t* wsf = nullptr;
+  float alpha = 1.f;
+  int qfmt = 0;
 };
 
 struct GLayer {  // EmbeddingGemma 2 text layer / Gemma 4 vision layer
@@ -1412,6 +1490,11 @@ struct NLayer {  // NeoMME layer
 
 struct Engine {
   int arch = 0, dt = DT_BF16, dev = 0;
+  int quant = 0;  // 0 off, 1 MXFP8 (E4M3 + UE8M0 per 32), 2 NVFP4 (E2M1 + UE4M3 per 16): GEMM inputs only
+  cublasLtHandle_t lt = nullptr;
+  uint8_t *qx = nullptr, *qsf = nullptr;  // quantized activations + their scales
+  size_t qx_bytes = 0, qsf_bytes = 0;
+  std::unordered_map<std::string, cublasLtMatmulAlgo_t> algos;
   cudaStream_t st = nullptr;
   cublasHandle_t cb = nullptr;
   void* ws = nullptr;
@@ -1564,10 +1647,75 @@ bool fp32_emu() {
   return g_fp32_emu;
 }
 
+inline unsigned nblk(size_t n, int per = 256) { return (unsigned)std::min<size_t>((n + per - 1) / per, 65535 * 8); }
+
+inline int qblk(int fmt) { return fmt == 1 ? 32 : 16; }
+inline int sfk_pad(int K, int fmt) { return (K / qblk(fmt) + 3) / 4 * 4; }
+inline size_t sf_bytes(int rows, int K, int fmt) { return (size_t)((rows + 127) / 128) * 128 * sfk_pad(K, fmt); }
+
+void quantize(Engine& e, const bf16* x, int rows, int K, int fmt, float gscale, void* q, uint8_t* sf) {
+  const int nb = K / qblk(fmt);
+  const size_t total = (size_t)rows * nb;
+  // tiles past the last row must read as zero scales
+  const size_t full = (size_t)(rows / 128) * (sfk_pad(K, fmt) / 4) * 512, all = sf_bytes(rows, K, fmt);
+  if (all > full) CK(cudaMemsetAsync(sf + full, 0, all - full, e.st));
+  if (fmt == 1)
+    k_quant_blocks<1><<<nblk(total), 256, 0, e.st>>>(x, rows, K, gscale, (uint8_t*)q, sf, sfk_pad(K, fmt));
+  else
+    k_quant_blocks<2><<<nblk(total), 256, 0, e.st>>>(x, rows, K, gscale, (uint8_t*)q, sf, sfk_pad(K, fmt));
+  CK(cudaGetLastError());
+}
+
+// Y[M, n] (bf16) = (block-scaled X) * (block-scaled W)^T on cuBLASLt (TN, FP32 compute)
+void gemm_q(Engine& e, const void* X, const Lin& W, void* Y, int M) {
+  const int K = W.k, fmt = W.qfmt;
+  REQ((size_t)M * K / (fmt == 1 ? 1 : 2) <= e.qx_bytes && sf_bytes(M, K, fmt) <= e.qsf_bytes,
+      "quantized activation buffer too small");
+  quantize(e, (const bf16*)X, M, K, fmt, 1.f, e.qx, e.qsf);
+  const cudaDataType_t qt = fmt == 1 ? CUDA_R_8F_E4M3 : CUDA_R_4F_E2M1;
+  cublasLtMatmulDesc_t d;
+  CB(cublasLtMatmulDescCreate(&d, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+  const cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
+  const int32_t mode = fmt == 1 ? CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0 : CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+  const void *sa = W.wsf, *sb = e.qsf;
+  CB(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof(tA)));
+  CB(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof(tB)));
+  CB(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode, sizeof(mode)));
+  CB(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode, sizeof(mode)));
+  CB(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &sa, sizeof(sa)));
+  CB(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sb, sizeof(sb)));
+  cublasLtMatrixLayout_t la, lb, lc;
+  CB(cublasLtMatrixLayoutCreate(&la, qt, K, W.n, K));
+  CB(cublasLtMatrixLayoutCreate(&lb, qt, K, M, K));
+  CB(cublasLtMatrixLayoutCreate(&lc, CUDA_R_16BF, W.n, M, W.n));
+  const std::string key = std::to_string(W.n) + "x" + std::to_string(K) + "x" + std::to_string(M) + "f" + std::to_string(fmt);
+  auto it = e.algos.find(key);
+  if (it == e.algos.end()) {
+    cublasLtMatmulPreference_t pref;
+    CB(cublasLtMatmulPreferenceCreate(&pref));
+    const size_t wsb = 64ull << 20;
+    CB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsb, sizeof(wsb)));
+    cublasLtMatmulHeuristicResult_t res;
+    int got = 0;
+    const cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(e.lt, d, la, lb, lc, lc, pref, 1, &res, &got);
+    cublasLtMatmulPreferenceDestroy(pref);
+    REQ(hs == CUBLAS_STATUS_SUCCESS && got > 0,
+        "cuBLASLt has no " + std::string(fmt == 1 ? "MXFP8" : "NVFP4") + " kernel for " + key + " on this GPU");
+    it = e.algos.emplace(key, res.algo).first;
+  }
+  const float al = W.alpha, be = 0.f;
+  CB(cublasLtMatmul(e.lt, d, &al, W.wq, la, e.qx, lb, &be, Y, lc, Y, lc, &it->second, e.ws, 64ull << 20, e.st));
+  cublasLtMatrixLayoutDestroy(la);
+  cublasLtMatrixLayoutDestroy(lb);
+  cublasLtMatrixLayoutDestroy(lc);
+  cublasLtMatmulDescDestroy(d);
+}
+
 // Y[M, n] = X[M, k] * W[n, k]^T  (row-major everything)
 void gemm(Engine& e, const void* X, const Lin& W, void* Y, int M, int dt = -1) {
   if (M == 0) return;
   if (dt < 0) dt = e.dt;
+  if (W.qfmt && dt == DT_BF16) return gemm_q(e, X, W, Y, M);
   const float al = 1.f, be = 0.f;
   const cudaDataType_t t = dt == DT_F32 ? CUDA_R_32F : CUDA_R_16BF;
   const cublasComputeType_t ct = (dt == DT_F32 && fp32_emu()) ? CUBLAS_COMPUTE_32F_EMULATED_16BFX9 : CUBLAS_COMPUTE_32F;
@@ -1581,7 +1729,62 @@ void gemm(Engine& e, const void* X, const Lin& W, void* Y, int M, int dt = -1) {
   CB(st);
 }
 
-inline unsigned nblk(size_t n, int per = 256) { return (unsigned)std::min<size_t>((n + per - 1) / per, 65535 * 8); }
+
+
+void dfree(Engine& e, void* p) {
+  auto it = std::find(e.owned.begin(), e.owned.end(), p);
+  if (it != e.owned.end()) {
+    e.owned.erase(it);
+    cudaFree(p);
+  }
+}
+
+// Narrow-precision copy of a bf16 weight (the bf16 copy is released). NVFP4 weights get a per-tensor pre-scale
+// g = 448 * 6 / amax so that block scales use the UE4M3 range; alpha = 1 / g undoes it in the GEMM.
+void quantize_lin(Engine& e, Lin& L, int fmt) {
+  if (!L.w || !L.n) return;
+  REQ(e.dt == DT_BF16, "--quant needs --dtype bf16");
+  REQ(L.k % 32 == 0, "quantized GEMM needs K % 32 == 0");
+  float g = 1.f;
+  if (fmt == 2) {
+    unsigned* d = (unsigned*)dmalloc(e, 4);
+    CK(cudaMemsetAsync(d, 0, 4, e.st));
+    k_amax_bf16<<<1024, 256, 0, e.st>>>((const bf16*)L.w, (size_t)L.n * L.k, d);
+    unsigned h = 0;
+    CK(cudaMemcpyAsync(&h, d, 4, cudaMemcpyDeviceToHost, e.st));
+    CK(cudaStreamSynchronize(e.st));
+    dfree(e, d);
+    float amax;
+    std::memcpy(&amax, &h, 4);
+    g = amax > 0.f ? 448.f * 6.f / amax : 1.f;
+  }
+  const size_t qb = fmt == 1 ? (size_t)L.n * L.k : (size_t)L.n * L.k / 2, sb = sf_bytes(L.n, L.k, fmt);
+  L.wq = dmalloc(e, qb);
+  L.wsf = (uint8_t*)dmalloc(e, sb);
+  CK(cudaMemsetAsync(L.wsf, 0, sb, e.st));
+  quantize(e, (const bf16*)L.w, L.n, L.k, fmt, g, L.wq, L.wsf);
+  CK(cudaStreamSynchronize(e.st));
+  e.weight_bytes += qb + sb;
+  e.weight_bytes -= (size_t)L.n * L.k * 2;
+  dfree(e, L.w);
+  L.w = nullptr;
+  L.alpha = 1.f / g;
+  L.qfmt = fmt;
+}
+
+// rows [r0, r0 + n) of a weight (EmbeddingGemma 2's per-layer slice of the PLE projection)
+Lin slice_rows(const Engine& e, const Lin& L, int r0, int n) {
+  Lin s = L;
+  s.n = n;
+  if (L.qfmt) {
+    REQ(r0 % 128 == 0, "quantized row slice must start on a 128-row scale tile");
+    s.wq = (char*)L.wq + (size_t)r0 * L.k / (L.qfmt == 1 ? 1 : 2);
+    s.wsf = L.wsf + (size_t)(r0 / 128) * (sfk_pad(L.k, L.qfmt) / 4) * 512;
+  } else {
+    s.w = (char*)L.w + (size_t)r0 * L.k * e.esz();
+  }
+  return s;
+}
 
 template <typename T>
 void resid_norm(Engine& e, int ntok, int n, const void* x, int x_mode, const float* w_post, float xmul, float* h,
@@ -1866,6 +2069,17 @@ void plan(Engine& e) {
     add(P / 4 * VH * es);       // ev (pooled, pre-projection)
     add(P / 4 * H * es);        // soft tokens
   }
+  if (e.quant) {
+    int kmax = 0;
+    for (auto& l : e.gl) kmax = std::max({kmax, l.qkv.k, l.o.k, l.gu.k, l.down.k});
+    for (auto& l : e.vl) kmax = std::max({kmax, l.qkv.k, l.o.k, l.gu.k, l.down.k});
+    for (auto& l : e.nl) kmax = std::max({kmax, l.qkvg.k, l.o.k, l.up.k, l.down.k});
+    const int rows = std::max(e.max_tok, e.has_vision ? e.max_patch : 0);
+    e.qx_bytes = (size_t)rows * kmax / (e.quant == 1 ? 1 : 2);
+    e.qsf_bytes = sf_bytes(rows, kmax, e.quant);
+    add(e.qx_bytes);
+    add(e.qsf_bytes);
+  }
   e.arena_bytes = need;
   CK(cudaMalloc((void**)&e.arena, need));
   e.owned.push_back(e.arena);
@@ -1885,6 +2099,10 @@ void plan(Engine& e) {
   e.b_pool = (float*)carve(e, 4096 * H * 4);
   e.b_out = (float*)carve(e, 4096 * 1024 * 4);
   e.b_meta = (int*)carve(e, e.meta_ints * 4);
+  if (e.quant) {
+    e.qx = (uint8_t*)carve(e, e.qx_bytes);
+    e.qsf = (uint8_t*)carve(e, e.qsf_bytes);
+  }
   if (e.arch == ARCH_NEOMME) {
     const size_t P = e.max_patch;
     e.n_patch_u8 = (uint8_t*)carve(e, P * 3072);
@@ -2072,7 +2290,7 @@ void gemma_layers(Engine& e, int ntok, const Meta& m, std::vector<GLayer>& layer
     if (ple) {
       resid_norm<T>(e, ntok, H, t1, 1, l.w_pf, 0.f, h, 1.f, nullptr, 0, 0, 2, nullptr, y, nullptr);
       gemm(e, y, l.pg, t1, ntok);  // gate
-      Lin sl{(char*)e.ple_w.w + (size_t)li * e.ple * e.ple_w.k * e.esz(), e.ple, e.ple_w.k};
+      const Lin sl = slice_rows(e, e.ple_w, (int)li * e.ple, e.ple);
       gemm(e, emb, sl, t2, ntok);  // this layer's slice of the per-layer projection
       REQ(e.ple == 512, "PLE width 512 expected");
       k_ple_w<T, 4><<<(ntok + 7) / 8, 256, 0, e.st>>>((const T*)t1, (const T*)t2, e.ple_scale, e.w_ple_norm, e.eps, (T*)y,
@@ -2339,6 +2557,7 @@ void* fe_new(int arch, int dtype, int device) {
         CK(cudaSetDevice(device));
         CK(cudaStreamCreateWithFlags(&e->st, cudaStreamNonBlocking));
         CB(cublasCreate(&e->cb));
+        CB(cublasLtCreate(&e->lt));
         CB(cublasSetStream(e->cb, e->st));
         CB(cublasSetMathMode(e->cb, CUBLAS_DEFAULT_MATH));  // FP32 GEMMs stay true FP32 (no TF32)
         if (fp32_emu() && cublasSetEmulationStrategy(e->cb, CUBLAS_EMULATION_STRATEGY_EAGER) != CUBLAS_STATUS_SUCCESS)
@@ -2383,6 +2602,16 @@ int fe_build(void* h, int max_tokens, int max_patches) {
     e.img_bytes = (size_t)cfgv(e, "img_bytes", 0);
     if (e.arch == ARCH_GEMMA) build_gemma(e);
     else build_neomme(e);
+    e.quant = (int)cfgv(e, "quant", 0);
+    if (e.quant) {  // the layer GEMMs (embedding / patch / output heads stay bf16)
+      for (auto& l : e.gl)
+        for (Lin* L : {&l.qkv, &l.o, &l.gu, &l.down, &l.pg, &l.pp}) quantize_lin(e, *L, e.quant);
+      for (auto& l : e.vl)
+        for (Lin* L : {&l.qkv, &l.o, &l.gu, &l.down}) quantize_lin(e, *L, e.quant);
+      for (auto& l : e.nl)
+        for (Lin* L : {&l.qkvg, &l.o, &l.up, &l.down}) quantize_lin(e, *L, e.quant);
+      if (e.ple_w.w) quantize_lin(e, e.ple_w, e.quant);
+    }
     CK(cudaStreamSynchronize(e.st));
     for (auto& kv : e.raw) cudaFree(kv.second.p);
     e.raw.clear();
@@ -2484,6 +2713,7 @@ void fe_free(void* h) {
   for (void* p : e->owned) cudaFree(p);
   if (e->pin) cudaFreeHost(e->pin);
   if (e->cb) cublasDestroy(e->cb);
+  if (e->lt) cublasLtDestroy(e->lt);
   if (e->st) cudaStreamDestroy(e->st);
   delete e;
 }
