@@ -27,12 +27,17 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ndarray-npy = "0.10"
 libc = "0.2"
+# ONNX graph rewriting for the quantized variants (`flashembed quantize`, src/quant.rs)
+prost = "0.14"
+regex = "1"
 candle-core = { version = "0.11", optional = true }
 candle-nn = { version = "0.11", optional = true }
 memmap2 = { version = "0.9", optional = true }
 
 [build-dependencies]
 cc = "1"
+prost-build = "0.14"
+protox = "0.9"
 
 [features]
 # Only for the backend-evidence GEMM microbenchmark; the runner itself does not use candle.
@@ -60,6 +65,10 @@ path = "src/bin/flash_check.rs"
 [[bin]]
 name = "linear-bench"
 path = "src/bin/linear_bench.rs"
+
+[[bin]]
+name = "qgemm-bench"
+path = "src/bin/qgemm_bench.rs"
 
 [[bin]]
 name = "candle-neomme"
