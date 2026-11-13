@@ -3,3 +3,5 @@ pub mod pil_resize;
 pub mod prep;
 pub mod media;
 pub mod flash;
+#[cfg(feature = "cuda")]
+pub mod gpu;

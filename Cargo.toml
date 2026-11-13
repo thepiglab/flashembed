@@ -29,10 +29,16 @@ ndarray-npy = "0.10"
 libc = "0.2"
 candle-core = { version = "0.11", optional = true }
 candle-nn = { version = "0.11", optional = true }
+memmap2 = { version = "0.9", optional = true }
+
+[build-dependencies]
+cc = "1"
 
 [features]
 # Only for the backend-evidence GEMM microbenchmark; the runner itself does not use candle.
 candle = ["dep:candle-core", "dep:candle-nn"]
+# GPU runner (flashembed-gpu): native CUDA engine in cuda/fegpu.cu, built with nvcc (CUDA >= 12.8 for Blackwell).
+cuda = ["dep:memmap2"]
 
 [[bin]]
 name = "flashembed"
@@ -41,6 +47,11 @@ path = "src/main.rs"
 [lib]
 name = "flashembed"
 path = "src/lib.rs"
+
+[[bin]]
+name = "flashembed-gpu"
+path = "src/bin/flashembed_gpu.rs"
+required-features = ["cuda"]
 
 [[bin]]
 name = "flash-check"
