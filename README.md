@@ -23,6 +23,8 @@ the same inputs, nodes and CPUs, over 353 cases measured on both runtimes, on th
 - **Same vectors.** Cosine >= 0.9999999 to the reference in every case. Covers text from 128 tokens to each model's
   maximum, PNG/JPEG/GIF/WebP images and real published figures, WAV/MP3/FLAC/Ogg/Opus/M4A audio,
   MP4/MOV/AVI/MKV/WebM video, and NeoMME documents and queries (dense and late vectors).
+  EmbeddingGemma 2's Matryoshka sizes (768/512/256/128, `--dim`) match sentence-transformers' `truncate_dim` at
+  every size and modality (cosine >= 0.9999999, identical top-5 neighbours).
 - **Faster:** in 351 of 353 cases; median 1.82x.
   - Short text: 1.1-1.7x.
   - Long text: 2.2-3.1x at EmbeddingGemma 2's 8,192 tokens and 4.4-6.1x at NeoMME's 16,384.
@@ -44,7 +46,8 @@ the same inputs, nodes and CPUs, over 353 cases measured on both runtimes, on th
 
 All in [docs/PROFILING.md](docs/PROFILING.md), with the method and hardware:
 
-- **Parity**: per-item cosine against the reference runtime, for every model, modality, file type, length and CPU.
+- **Parity**: per-item cosine against the reference runtime, for every model, modality, file type, length and CPU,
+  and for each EmbeddingGemma 2 Matryoshka size.
 - **Throughput and memory**: items/s and peak RSS over a thread (4/8/16/32) x batch (1/2/4) grid for text and images.
 - **Context length**: 128 to 16,384 tokens, mixed-length batches, over-maximum inputs (truncation), short queries.
 - **Modalities and file types**: image formats and sizes, image token budgets, audio formats and lengths, video
@@ -100,7 +103,9 @@ target/release/flashembed embed --model gemma --modality text --input docs.jsonl
 
 `embed` writes `embeddings.dense.npy` ([N, dim], L2-normalised), `embeddings.ids.json` and, for NeoMME,
 `embeddings.late.npy` plus `embeddings.late_offsets.npy` (row ranges per item). Options: `--modality
-text|image|audio|video`, `--side document|query` (NeoMME), `--threads`, `--batch`, `--max-len`, `--max-soft-tokens`.
+text|image|audio|video`, `--side document|query` (NeoMME), `--threads`, `--batch`, `--max-len`, `--max-soft-tokens`,
+`--dim 768|512|256|128` (EmbeddingGemma 2 Matryoshka size: keeps the leading dimensions and re-normalises, as
+sentence-transformers' `truncate_dim` does; queries and documents must use the same size).
 Text is embedded as given: add the model card's prompt prefix yourself (EmbeddingGemma 2:
 `title: {title} | text: {content}` for documents, `task: search result | query: {q}` for queries).
 `flashembed bench` runs the benchmark harness; `flash-check` tests the attention kernel against an f64 reference.
@@ -119,7 +124,8 @@ Text is embedded as given: add the model card's prompt prefix yourself (Embeddin
 | media | `media.sbatch` | audio/video/format/size inputs, acceptance probe |
 | export | `export.sbatch` | ONNX graphs + wrapper-vs-HF parity checks |
 | build | `build.sbatch` (`TAG=...`) | release build on node-local disk, installs `$EMBED_ROOT/bin/flashembed-$TAG` |
-| smoke | `smoke.sbatch` (`BIN=... ONNX=...`) | quick check: kernel test, reference vs flashembed parity + speed for every model x modality, `embed` |
+| smoke | smoke | `smoke.sbatch` (`BIN=... ONNX=...`) | quick check: kernel test, reference vs flashembed parity + speed for every model x modality, `embed` |
+| mrl | `mrl.sbatch` (`BIN=... ONNX=...`) | EmbeddingGemma 2 Matryoshka sizes vs sentence-transformers' `truncate_dim`, all modalities |
 | bench / ctx / mm / ops | `bench.sbatch`, `ctx.sbatch`, `mm.sbatch`, `ops.sbatch` | the benchmark families in PROFILING.md |
 
 `py/final_report.py` collects a results tree into the tables of PROFILING.md (`py/fill_doc.py`).
@@ -136,7 +142,7 @@ Text is embedded as given: add the model card's prompt prefix yourself (Embeddin
 | `py/export_onnx.py` | ONNX export with the custom ops and graph rewrites, parity checks against HF |
 | `py/py_bench.py` | reference runtime benchmark (the model-card Python code path) |
 | `py/make_*.py`, `py/scan_media.py` | benchmark inputs from the PMC open-access subset (+ synthetic media) |
-| `py/final_report.py`, `py/compare.py`, `py/profile_ops.py`, ... | reports, parity, per-op profiles, diagnostics |
+| `py/final_report.py`, `py/mrl_report.py`, `py/compare.py`, `py/profile_ops.py`, ... | reports, parity, per-op profiles, diagnostics |
 | `slurm/` | job scripts (site-neutral) |
 
 ## License

@@ -82,6 +82,25 @@ configs, lengths and file types; FP32 both sides):
 | neomme | image | 62 | 1.0000000 | 1.0000000 |
 | neomme | text | 70 | 1.0000000 | 1.0000000 |
 
+## Matryoshka output sizes (EmbeddingGemma 2)
+
+EmbeddingGemma 2 is trained with Matryoshka Representation Learning: its 768-d vector can be cut to the leading 512,
+256 or 128 dimensions and re-normalised. `slurm/mrl.sbatch` compares sentence-transformers'
+`encode(truncate_dim=d, normalize_embeddings=True)` with `flashembed --dim d` for every modality and size (EPYC 75F3,
+16 threads, batch 4; text = 32 documents + 16 queries with the card's prompts; images, audio and video across file
+formats). "Prefix check" is the max difference between sentence-transformers' d-dim output and its own 768-d output's
+first d dims re-normalised (i.e. truncation is exactly prefix + re-normalise). Neighbour agreement is the overlap of
+each item's top-5 most similar other items, Python vs flashembed.
+
+| modality | dims | items | min cosine Python vs flashembed | max abs(norm - 1) | prefix check | top-5 neighbour agreement |
+|---|---|---|---|---|---|---|
+| text | 768 / 512 / 256 / 128 | 48 | 0.9999999 at every size | <= 3.6e-7 | <= 8.9e-8 | 1.000 |
+| image | 768 / 512 / 256 / 128 | 16 | 0.9999999 at every size | <= 4.8e-7 | <= 6.0e-8 | 1.000 |
+| audio | 768 / 512 / 256 / 128 | 8 | 0.9999999 - 1.0000000 | <= 6.0e-7 | <= 6.0e-8 | 1.000 |
+| video | 768 / 512 / 256 / 128 | 7 | 0.9999999 - 1.0000000 | <= 2.4e-7 | <= 6.0e-8 | 1.000 |
+
+Truncation costs nothing measurable at runtime (a slice and a norm per vector after the forward pass).
+
 ## Throughput and peak RSS: text and images (thread x batch grid)
 
 <details><summary><b>EPYC 7702 (Zen 2, 2 sockets)</b></summary>

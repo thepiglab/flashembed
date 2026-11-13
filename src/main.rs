@@ -68,6 +68,10 @@ struct EmbedArgs {
     /// EmbeddingGemma 2 image budget (70, 140, 280, 560, 1120 soft tokens)
     #[arg(long, default_value_t = 280)]
     max_soft_tokens: usize,
+    /// EmbeddingGemma 2 Matryoshka (MRL) output size: 768 (native), 512, 256 or 128; keeps the leading dims
+    /// and re-normalises, like sentence-transformers' `truncate_dim` + `normalize_embeddings`
+    #[arg(long)]
+    dim: Option<usize>,
 }
 
 impl EmbedArgs {
@@ -81,7 +85,7 @@ impl EmbedArgs {
             model: self.model, modality: self.modality, threads, batch: self.batch, n: usize::MAX, warmup: 0, max_len,
             inputs: dir, onnx: self.onnx, snapshot: self.snapshot, out: self.out, save: true, texts_file: file.clone(),
             images_file: file, side: self.side, tag_suffix: String::new(), max_soft_tokens: self.max_soft_tokens,
-            decode_in_loop: true, no_sort: false, plain_names: true,
+            decode_in_loop: true, no_sort: false, plain_names: true, dim: self.dim,
         })
     }
 }
@@ -155,6 +159,9 @@ struct BenchArgs {
     /// `embed`: write embeddings.* instead of benchmark-tagged file names
     #[arg(skip)]
     plain_names: bool,
+    /// EmbeddingGemma 2 Matryoshka output size (768/512/256/128): truncate dense vectors, then re-normalise
+    #[arg(long)]
+    dim: Option<usize>,
 }
 
 fn oe<T, E: std::fmt::Display>(r: std::result::Result<T, E>) -> Result<T> {
@@ -746,6 +753,11 @@ fn load_items(dir: &Path, modality: Modality, n: usize, a: &BenchArgs) -> Result
 }
 
 fn bench(a: BenchArgs) -> Result<()> {
+    if let Some(d) = a.dim {
+        if a.model != ModelKind::Gemma || ![128, 256, 512, 768].contains(&d) {
+            bail!("--dim is EmbeddingGemma 2's Matryoshka size: 768, 512, 256 or 128");
+        }
+    }
     let t_load = Instant::now();
     let (ids, items) = load_items(&a.inputs, a.modality, a.n, &a)?;
     // Thread-pool policy autotune: time the first batch under each candidate (one runner alive at a time) and keep
@@ -842,7 +854,7 @@ fn bench(a: BenchArgs) -> Result<()> {
     let ntok: usize = outs.iter().map(|o| o.ntok).sum();
     let res = json!({
         "tag": tag, "runtime": "rust-ort", "model": model, "modality": modality, "threads": a.threads,
-        "batch": a.batch, "n": items.len(), "warmup_batches": a.warmup, "wall_s": wall,
+        "batch": a.batch, "dim": a.dim, "n": items.len(), "warmup_batches": a.warmup, "wall_s": wall,
         "items_per_s": items.len() as f64 / wall, "batch_latency_s": lat, "load_s": load_s,
         "peak_rss_mb": peak_rss_mb(), "tokens_total": ntok, "dtype": "float32",
         "infer_s": r.infer_s, "prep_post_s": wall - r.infer_s, "side": a.side, "texts_file": a.texts_file,
@@ -862,6 +874,13 @@ fn bench(a: BenchArgs) -> Result<()> {
         }
     }
     per.sort_by_key(|x| x.0);
+    if let Some(d) = a.dim {
+        // Matryoshka: keep the leading d dims of the (already normalised) vector, then re-normalise
+        for x in per.iter_mut() {
+            x.1.truncate(d);
+            l2_normalize(&mut x.1);
+        }
+    }
     let outs = vec![BatchOut {
         dense: per.iter().map(|x| x.1.clone()).collect(),
         late: if outs[0].late.is_empty() { vec![] } else { per.iter().map(|x| x.2.clone()).collect() },

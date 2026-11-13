@@ -62,6 +62,8 @@ def main() -> None:
     ap.add_argument("--tag-suffix", default="", help="appended to the output tag, e.g. _L2048 (no '-')")
     ap.add_argument("--max-soft-tokens", type=int, default=280, help="Gemma image soft-token budget")
     ap.add_argument("--decode-in-loop", action="store_true", help="pass image file paths (decode inside timing)")
+    ap.add_argument("--truncate-dim", type=int, default=None,
+                    help="Gemma Matryoshka size (512/256/128): sentence-transformers truncate_dim, re-normalised")
     args = ap.parse_args()
     if args.max_len is None:
         args.max_len = 512 if args.modality == "text" else 8192
@@ -96,7 +98,8 @@ def main() -> None:
             # Texts already carry the card's document format ("title: ... | text: ..."); images take no prefix.
             if args.modality != "text" and isinstance(batch[0], str):
                 batch = [{args.modality: x} for x in batch]  # file paths -> modality dicts (card usage)
-            v = model.encode(batch, batch_size=len(batch), convert_to_numpy=True, normalize_embeddings=True)
+            v = model.encode(batch, batch_size=len(batch), convert_to_numpy=True, normalize_embeddings=True,
+                             truncate_dim=args.truncate_dim)
             return {"dense": v}
     else:
         from transformers import NeoMMEForRetrieval, NeoMMEProcessor
@@ -163,7 +166,7 @@ def main() -> None:
         "batch": args.batch, "n": len(items), "warmup_batches": args.warmup, "wall_s": wall,
         "items_per_s": len(items) / wall, "batch_latency_s": lat, "load_s": load_s,
         "peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
-        "tokens_total": sum(ntoks) or None, "side": args.side, "texts_file": args.texts_file, **extra,
+        "tokens_total": sum(ntoks) or None, "side": args.side, "texts_file": args.texts_file, "truncate_dim": args.truncate_dim, **extra,
         "dtype": "float32", "torch": torch.__version__, "cpu": lscpu_model(), "host": platform.node(),
         "job": os.environ.get("SLURM_JOB_ID"), "python": sys.version.split()[0],
     }
