@@ -42,7 +42,7 @@ const PIL_PRECISION_BITS: u32 = 32 - 8 - 2;
 pub static TORCH_INT16_WEIGHTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// precompute_coeffs + coefficient quantization. Returns (ksize, bounds [(xmin, n)], fixed-point coeffs, precision).
-fn coeffs(in_size: usize, out_size: usize, f: Filter) -> (usize, Vec<(usize, usize)>, Vec<i32>, u32) {
+pub fn coeffs(in_size: usize, out_size: usize, f: Filter) -> (usize, Vec<(usize, usize)>, Vec<i32>, u32) {
     let scale = in_size as f64 / out_size as f64;
     let filterscale = scale.max(1.0);
     let support = f.support() * filterscale;

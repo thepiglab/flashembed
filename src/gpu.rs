@@ -18,9 +18,14 @@ unsafe extern "C" {
         h: *mut c_void, npatch: c_int, nimg: c_int, vcu: *const i32, pos: *const i32, patches: *const f32, nslot: c_int,
         slot_ptr: *const i32, slot_patch: *const i32,
     ) -> c_int;
+    fn fe_gemma_vision_u8(
+        h: *mut c_void, npatch: c_int, nimg: c_int, vcu: *const i32, pos: *const i32, src: *const u8, src_bytes: u64,
+        desc: *const i32, coef: *const i32, ncoef: u64, max_pix: c_int, nslot: c_int, slot_ptr: *const i32,
+        slot_patch: *const i32,
+    ) -> c_int;
     fn fe_neomme(
         h: *mut c_void, ntok: c_int, nseq: c_int, ids: *const i32, cu: *const i32, pos2: *const i32, npatch: c_int,
-        patches: *const f32, patch_rows: *const i32, dense: *mut f32, late: *mut f32,
+        patches: *const u8, patch_rows: *const i32, dense: *mut f32, late: *mut f32,
     ) -> c_int;
     fn fe_mem(h: *mut c_void, out: *mut u64) -> c_int;
     fn fe_device_name(buf: *mut c_char, n: c_int) -> c_int;
@@ -101,7 +106,8 @@ fn for_tensors(path: &Path, keep: &dyn Fn(&str) -> bool, f: &mut dyn FnMut(&str,
 
 impl Engine {
     /// Load a model from its HF snapshot. `vision`: also build EmbeddingGemma 2's vision tower.
-    pub fn load(snapshot: &Path, arch: Arch, dtype: Dtype, vision: bool, max_tokens: usize, max_patches: usize) -> Result<Self> {
+    /// `img_bytes` > 0: GPU image preprocessing (EmbeddingGemma 2) with this many bytes of decoded images per batch.
+    pub fn load(snapshot: &Path, arch: Arch, dtype: Dtype, vision: bool, max_tokens: usize, max_patches: usize, img_bytes: usize) -> Result<Self> {
         let cfg: Value = serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json"))?)?;
         let h = unsafe {
             fe_new(match arch { Arch::Gemma => 0, Arch::Neomme => 1 }, match dtype { Dtype::F32 => 0, Dtype::Bf16 => 1 }, 0)
@@ -134,6 +140,7 @@ impl Engine {
                 if vision {
                     let v = &cfg["vision_config"];
                     set("vision", 1.0)?;
+                    set("img_bytes", img_bytes as f64)?;
                     set("v_hidden", num(v, "hidden_size")?)?;
                     set("v_layers", num(v, "num_hidden_layers")?)?;
                     set("v_heads", num(v, "num_attention_heads")?)?;
@@ -220,9 +227,22 @@ impl Engine {
         })
     }
 
-    /// NeoMME: returns (dense [nseq * 1024], late [ntok * 128] when `late`)
+    /// Vision tower with GPU-side preprocessing (see `ImagePlan`).
     #[allow(clippy::too_many_arguments)]
-    pub fn neomme(&mut self, ids: &[i32], cu: &[i32], pos2: Option<&[i32]>, patches: &[f32], patch_rows: &[i32], late: bool) -> Result<(Vec<f32>, Vec<f32>)> {
+    pub fn gemma_vision_u8(&mut self, vcu: &[i32], pos: &[i32], src: &[u8], desc: &[i32], coef: &[i32], max_pix: usize, slot_ptr: &[i32], slot_patch: &[i32]) -> Result<()> {
+        let npatch = pos.len() / 2;
+        ck(unsafe {
+            fe_gemma_vision_u8(
+                self.h, npatch as c_int, (vcu.len() - 1) as c_int, vcu.as_ptr(), pos.as_ptr(), src.as_ptr(), src.len() as u64,
+                desc.as_ptr(), coef.as_ptr(), coef.len() as u64, max_pix as c_int, (slot_ptr.len() - 1) as c_int,
+                slot_ptr.as_ptr(), slot_patch.as_ptr(),
+            )
+        })
+    }
+
+    /// NeoMME: returns (dense [nseq * 1024], late [ntok * 128] when `late`); patches are uint8 (prep::neomme_image_u8)
+    #[allow(clippy::too_many_arguments)]
+    pub fn neomme(&mut self, ids: &[i32], cu: &[i32], pos2: Option<&[i32]>, patches: &[u8], patch_rows: &[i32], late: bool) -> Result<(Vec<f32>, Vec<f32>)> {
         let nseq = cu.len() - 1;
         let mut dense = vec![0f32; nseq * self.out_dim];
         let mut lv = if late { vec![0f32; ids.len() * 128] } else { vec![] };
@@ -240,5 +260,74 @@ impl Engine {
         let mut o = [0u64; 4];
         ck(unsafe { fe_mem(self.h, o.as_mut_ptr()) })?;
         Ok(MemInfo { weights: o[0], arena: o[1], device_used: o[2], device_total: o[3] })
+    }
+}
+
+/// GPU resize plan for one EmbeddingGemma 2 image: the HF Gemma 4 processor's target size and the Pillow/ATen
+/// bicubic coefficients (`pil_resize::coeffs`), in the descriptor layout `cuda/fegpu.cu` expects
+/// (D_SRC, D_W, D_H, D_TW, D_TH, D_TMP, D_ROWS, D_YB0, D_CH, D_KSH, D_PH, D_CV, D_KSV, D_PV, D_PATCH, D_NEEDH, D_NEEDV).
+pub struct ImagePlan {
+    pub tw: usize,
+    pub th: usize,
+    pub tmp_bytes: usize,
+    pub max_pix: usize,
+    desc: [i32; 20],
+    coef: Vec<i32>,
+}
+
+pub const DESC_N: usize = 20;
+
+impl ImagePlan {
+    pub fn new(w: usize, h: usize, max_patches: usize) -> Result<Self> {
+        use crate::pil_resize::{Filter, coeffs};
+        let (th, tw) = crate::prep::gemma_target_size(h, w, max_patches)?;
+        let (need_h, need_v) = (tw != w, th != h);
+        let (ksv, bv, kv, pv) = coeffs(h, th, Filter::Bicubic);
+        let (yb0, yb1) = (bv[0].0, bv[th - 1].0 + bv[th - 1].1);
+        let rows = if need_h { yb1 - yb0 } else { h };
+        let mut coef = vec![];
+        let mut desc = [0i32; 20];
+        if need_h {
+            let (ksh, bh, kh, ph) = coeffs(w, tw, Filter::Bicubic);
+            desc[8] = 0;
+            desc[9] = ksh as i32;
+            desc[10] = ph as i32;
+            for b in &bh {
+                coef.push(b.0 as i32);
+                coef.push(b.1 as i32);
+            }
+            coef.extend_from_slice(&kh);
+        }
+        desc[11] = coef.len() as i32;
+        desc[12] = ksv as i32;
+        desc[13] = pv as i32;
+        for b in &bv {
+            coef.push(b.0 as i32);
+            coef.push(b.1 as i32);
+        }
+        coef.extend_from_slice(&kv);
+        desc[1] = w as i32;
+        desc[2] = h as i32;
+        desc[3] = tw as i32;
+        desc[4] = th as i32;
+        desc[6] = rows as i32;
+        desc[7] = yb0 as i32;
+        desc[15] = need_h as i32;
+        desc[16] = need_v as i32;
+        let tmp_bytes = if need_h { tw * rows * 3 } else { 0 };
+        Ok(ImagePlan { tw, th, tmp_bytes, max_pix: (tw * th).max(tw * rows), desc, coef })
+    }
+
+    /// Append to batch buffers: sets the source / tmp / coefficient / first-patch offsets.
+    pub fn append(&self, src_off: usize, tmp_off: usize, patch_off: usize, desc: &mut Vec<i32>, coef: &mut Vec<i32>) {
+        let mut d = self.desc;
+        let c0 = coef.len() as i32;
+        d[0] = src_off as i32;
+        d[5] = tmp_off as i32;
+        d[8] += c0;
+        d[11] += c0;
+        d[14] = patch_off as i32;
+        desc.extend_from_slice(&d);
+        coef.extend_from_slice(&self.coef);
     }
 }

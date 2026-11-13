@@ -235,6 +235,42 @@ pub fn neomme_image(img: &RgbImage) -> Result<NeoImage> {
     Ok(NeoImage { gh, gw, patches })
 }
 
+/// Same as `neomme_image`, but the patches stay uint8 (0 for the padding, which normalises to the processor's -1):
+/// the GPU runner uploads these and normalises on the device, a quarter of the bytes of the float patches.
+pub fn neomme_image_u8(img: &RgbImage) -> Result<(usize, usize, Vec<u8>)> {
+    let (h, w) = (img.height() as usize, img.width() as usize);
+    let im = if h.max(w) > N_MAX_SIDE {
+        let s = N_MAX_SIDE as f64 / h.max(w) as f64;
+        let (mut rh, mut rw) = (((h as f64) * s).round().max(1.0) as usize, ((w as f64) * s).round().max(1.0) as usize);
+        if rh.max(rw) > N_MAX_SIDE {
+            rh = ((h as f64) * s).floor().max(1.0) as usize;
+            rw = ((w as f64) * s).floor().max(1.0) as usize;
+        }
+        resize_rgb(img, rw as u32, rh as u32, Filter::Bilinear)?
+    } else {
+        img.clone()
+    };
+    let (h, w) = (im.height() as usize, im.width() as usize);
+    let (gh, gw) = (h.div_ceil(N_PATCH), w.div_ceil(N_PATCH));
+    let raw = im.as_raw();
+    let mut patches = vec![0u8; gh * gw * N_PATCH_DIM];
+    for r in 0..gh {
+        for c in 0..gw {
+            let dst = &mut patches[(r * gw + c) * N_PATCH_DIM..(r * gw + c + 1) * N_PATCH_DIM];
+            for py in 0..N_PATCH {
+                let y = r * N_PATCH + py;
+                if y >= h {
+                    break;
+                }
+                let x0 = c * N_PATCH;
+                let n = N_PATCH.min(w.saturating_sub(x0));
+                dst[py * N_PATCH * 3..py * N_PATCH * 3 + n * 3].copy_from_slice(&raw[(y * w + x0) * 3..(y * w + x0 + n) * 3]);
+            }
+        }
+    }
+    Ok((gh, gw, patches))
+}
+
 /// Token ids, 2-axis positions ([seq] x 2, (row, col)) and patch flags for one NeoMME page image.
 pub fn neomme_image_layout(gh: usize, gw: usize, doc: i64, img: i64, row: i64) -> (Vec<i64>, Vec<[i64; 2]>, Vec<bool>) {
     let s = 2 + gh * (gw + 1);

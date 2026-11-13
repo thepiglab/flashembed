@@ -68,6 +68,9 @@ struct Args {
     /// image patch budget per forward (EmbeddingGemma 2 vision tower / NeoMME patch stem)
     #[arg(long, default_value_t = 40320)]
     max_patches: usize,
+    /// EmbeddingGemma 2: MB of decoded images per batch for GPU-side resize + patching (0 = preprocess on the CPU)
+    #[arg(long, default_value_t = 128)]
+    img_mb: usize,
     #[arg(long, default_value_t = 1024)]
     max_items: usize,
     /// token limit per text (default: model maximum, 8192 / 16384)
@@ -96,6 +99,11 @@ struct Args {
     prep_only: bool,
 }
 
+enum GPrep {
+    Host(prep::GemmaImage),
+    Dev(gpu::ImagePlan, Vec<u8>),
+}
+
 static DECODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PREP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -114,8 +122,13 @@ fn timed_image<T>(path: &Path, f: impl Fn(&image::RgbImage) -> Result<T>) -> Res
 enum Batch {
     /// packed token ids, cu_seqlens, item indices
     Text { ids: Vec<i32>, cu: Vec<i32>, items: Vec<usize> },
-    GemmaImage { vcu: Vec<i32>, pos: Vec<i32>, patches: Vec<f32>, slot_ptr: Vec<i32>, slot_patch: Vec<i32>, ids: Vec<i32>, cu: Vec<i32>, mm: Vec<i32>, items: Vec<usize> },
-    NeoImage { ids: Vec<i32>, cu: Vec<i32>, pos: Vec<i32>, patches: Vec<f32>, rows: Vec<i32>, items: Vec<usize> },
+    /// EmbeddingGemma 2 images: either host-preprocessed float patches, or (dev) decoded RGB8 sources + resize
+    /// descriptors for GPU-side preprocessing
+    GemmaImage {
+        vcu: Vec<i32>, pos: Vec<i32>, patches: Vec<f32>, slot_ptr: Vec<i32>, slot_patch: Vec<i32>, ids: Vec<i32>, cu: Vec<i32>,
+        mm: Vec<i32>, items: Vec<usize>, dev: bool, src: Vec<u8>, desc: Vec<i32>, coef: Vec<i32>, tmp: usize, max_pix: usize,
+    },
+    NeoImage { ids: Vec<i32>, cu: Vec<i32>, pos: Vec<i32>, patches: Vec<u8>, rows: Vec<i32>, items: Vec<usize> },
 }
 
 struct Ctx {
@@ -177,7 +190,7 @@ fn run(a: Args) -> Result<()> {
     }
     let t_load = Instant::now();
     let vision = a.model == Model::Gemma && a.modality == Modality::Image;
-    let mut eng = Engine::load(&a.snapshot, arch, dtype, vision, a.max_tokens, a.max_patches)?;
+    let mut eng = Engine::load(&a.snapshot, arch, dtype, vision, a.max_tokens, a.max_patches, a.img_mb << 20)?;
     let load_s = t_load.elapsed().as_secs_f64();
     let mem_loaded = eng.mem()?;
     let out_dim = eng.out_dim;
@@ -316,8 +329,12 @@ fn execute(eng: &mut Engine, b: &Batch, late: bool) -> Result<(Vec<f32>, Vec<f32
             Arch::Gemma => Ok((eng.gemma_text(ids, cu, None)?, vec![])),
             Arch::Neomme => eng.neomme(ids, cu, None, &[], &[], late),
         },
-        Batch::GemmaImage { vcu, pos, patches, slot_ptr, slot_patch, ids, cu, mm, .. } => {
-            eng.gemma_vision(vcu, pos, patches, slot_ptr, slot_patch)?;
+        Batch::GemmaImage { vcu, pos, patches, slot_ptr, slot_patch, ids, cu, mm, dev, src, desc, coef, max_pix, .. } => {
+            if *dev {
+                eng.gemma_vision_u8(vcu, pos, src, desc, coef, *max_pix, slot_ptr, slot_patch)?;
+            } else {
+                eng.gemma_vision(vcu, pos, patches, slot_ptr, slot_patch)?;
+            }
             Ok((eng.gemma_text(ids, cu, Some(mm))?, vec![]))
         }
         Batch::NeoImage { ids, cu, pos, patches, rows, .. } => eng.neomme(ids, cu, Some(pos), patches, rows, late),
@@ -364,36 +381,71 @@ fn produce(a: &Args, ctx: &Ctx, raw: &[String], order: &[usize], dir: &Path, que
             // decode + preprocess chunks of images in parallel, then pack them into batches under the patch,
             // token and item budgets
             let mut gb: Option<Batch> = None;
-            let new_gemma = || Batch::GemmaImage { vcu: vec![0], pos: vec![], patches: vec![], slot_ptr: vec![0], slot_patch: vec![], ids: vec![], cu: vec![0], mm: vec![], items: vec![] };
+            let new_gemma = |dev: bool| Batch::GemmaImage {
+                vcu: vec![0], pos: vec![], patches: vec![], slot_ptr: vec![0], slot_patch: vec![], ids: vec![], cu: vec![0], mm: vec![],
+                items: vec![], dev, src: vec![], desc: vec![], coef: vec![], tmp: 0, max_pix: 0,
+            };
             let new_neo = || Batch::NeoImage { ids: vec![], cu: vec![0], pos: vec![], patches: vec![], rows: vec![], items: vec![] };
+            let img_budget = a.img_mb << 20;
             for chunk in order.chunks(64) {
                 match a.model {
                     Model::Gemma => {
-                        let ims: Vec<prep::GemmaImage> = chunk.par_iter().map(|&k| timed_image(&dir.join(&raw[k]), prep::gemma_image)).collect::<Result<_>>()?;
-                        for (&item, g) in chunk.iter().zip(&ims) {
-                            let np = g.n_soft * prep::G_POOL * prep::G_POOL;
+                        // GPU preprocessing: decode on the CPU, resize + patch on the GPU (images too large for the
+                        // byte budget fall back to CPU preprocessing)
+                        let ims: Vec<GPrep> = chunk
+                            .par_iter()
+                            .map(|&k| {
+                                let path = dir.join(&raw[k]);
+                                if img_budget == 0 {
+                                    return timed_image(&path, |im| Ok(GPrep::Host(prep::gemma_image(im)?)));
+                                }
+                                timed_image(&path, |im| {
+                                    let plan = gpu::ImagePlan::new(im.width() as usize, im.height() as usize, prep::G_MAX_PATCHES)?;
+                                    if im.as_raw().len() > img_budget || plan.tmp_bytes > img_budget {
+                                        return Ok(GPrep::Host(prep::gemma_image(im)?));
+                                    }
+                                    Ok(GPrep::Dev(plan, im.as_raw().clone()))
+                                })
+                            })
+                            .collect::<Result<_>>()?;
+                        for (&item, g) in chunk.iter().zip(ims) {
+                            let (dev, np, pw_patch) = match &g {
+                                GPrep::Host(h) => (false, h.n_soft * 9, 0),
+                                GPrep::Dev(p, _) => (true, (p.tw / 16) * (p.th / 16), p.tw / 16),
+                            };
+                            let n_soft = np / 9;
                             let mut mid = vec![ctx.boi];
-                            mid.extend(std::iter::repeat_n(ctx.image_id, g.n_soft));
+                            mid.extend(std::iter::repeat_n(ctx.image_id, n_soft));
                             mid.push(ctx.eoi);
                             let row = wrap(ctx, &mid);
                             if np > a.max_patches || row.len() > a.max_tokens {
                                 bail!("image needs {np} patches / {} tokens: raise --max-patches / --max-tokens", row.len());
                             }
-                            let flush = matches!(&gb, Some(Batch::GemmaImage { vcu, ids, items, .. })
-                                if *vcu.last().unwrap() as usize + np > a.max_patches || ids.len() + row.len() > a.max_tokens || items.len() >= a.max_items);
+                            let (sb, tb) = match &g { GPrep::Dev(p, src) => (src.len(), p.tmp_bytes), _ => (0, 0) };
+                            let flush = matches!(&gb, Some(Batch::GemmaImage { vcu, ids, items, dev: d, src, tmp, .. })
+                                if *vcu.last().unwrap() as usize + np > a.max_patches || ids.len() + row.len() > a.max_tokens
+                                    || items.len() >= a.max_items || *d != dev || src.len() + sb > img_budget || *tmp + tb > img_budget);
                             if flush {
                                 tx.send(Ok(gb.take().unwrap()))?;
                             }
-                            let Batch::GemmaImage { vcu, pos, patches, slot_ptr, slot_patch, ids, cu, mm, items } = gb.get_or_insert_with(new_gemma) else { unreachable!() };
+                            let Batch::GemmaImage { vcu, pos, patches, slot_ptr, slot_patch, ids, cu, mm, items, src, desc, coef, tmp, max_pix, .. } =
+                                gb.get_or_insert_with(|| new_gemma(dev))
+                            else {
+                                unreachable!()
+                            };
                             let p0 = *vcu.last().unwrap();
-                            let pw = (0..np).map(|p| g.positions[2 * p] as usize).max().unwrap_or(0) + 1;
-                            // pooling slot of patch p = (x / 3) + (pw / 3) * (y / 3) (HF _avg_pool_by_positions, k = 3)
-                            let mut slots: Vec<Vec<i32>> = vec![vec![]; g.n_soft];
-                            for p in 0..np {
-                                let (x, y) = (g.positions[2 * p] as usize, g.positions[2 * p + 1] as usize);
+                            // patch p = r * pw + c sits at (x, y) = (c, r); pooling slot = (x / 3) + (pw / 3) * (y / 3)
+                            // (HF _avg_pool_by_positions with k = 3)
+                            let xy: Vec<(usize, usize)> = match &g {
+                                GPrep::Host(h) => (0..np).map(|p| (h.positions[2 * p] as usize, h.positions[2 * p + 1] as usize)).collect(),
+                                GPrep::Dev(..) => (0..np).map(|p| (p % pw_patch, p / pw_patch)).collect(),
+                            };
+                            let pw = xy.iter().map(|q| q.0).max().unwrap_or(0) + 1;
+                            let mut slots: Vec<Vec<i32>> = vec![vec![]; n_soft];
+                            for (p, &(x, y)) in xy.iter().enumerate() {
                                 let s = x / 3 + (pw / 3) * (y / 3);
-                                if s >= g.n_soft {
-                                    bail!("pooling slot {s} out of range {}", g.n_soft);
+                                if s >= n_soft {
+                                    bail!("pooling slot {s} out of range {n_soft}");
                                 }
                                 slots[s].push(p0 + p as i32);
                                 pos.push(x as i32);
@@ -404,7 +456,15 @@ fn produce(a: &Args, ctx: &Ctx, raw: &[String], order: &[usize], dir: &Path, que
                                 slot_patch.extend(s);
                                 slot_ptr.push(slot_patch.len() as i32);
                             }
-                            patches.extend_from_slice(&g.patches[..np * prep::G_PATCH_DIM]);
+                            match g {
+                                GPrep::Host(h) => patches.extend_from_slice(&h.patches[..np * prep::G_PATCH_DIM]),
+                                GPrep::Dev(plan, bytes) => {
+                                    plan.append(src.len(), *tmp, p0 as usize, desc, coef);
+                                    src.extend_from_slice(&bytes);
+                                    *tmp += plan.tmp_bytes;
+                                    *max_pix = (*max_pix).max(plan.max_pix);
+                                }
+                            }
                             vcu.push(p0 + np as i32);
                             let mut k = 0;
                             for &t in &row {
@@ -421,10 +481,10 @@ fn produce(a: &Args, ctx: &Ctx, raw: &[String], order: &[usize], dir: &Path, que
                         }
                     }
                     Model::Neomme => {
-                        let ims: Vec<prep::NeoImage> = chunk.par_iter().map(|&k| timed_image(&dir.join(&raw[k]), prep::neomme_image)).collect::<Result<_>>()?;
-                        for (&item, im) in chunk.iter().zip(ims) {
-                            let (tids, tpos, flags) = prep::neomme_image_layout(im.gh, im.gw, ctx.doc_id, ctx.image_id, ctx.row_id);
-                            let np = im.gh * im.gw;
+                        let ims: Vec<(usize, usize, Vec<u8>)> = chunk.par_iter().map(|&k| timed_image(&dir.join(&raw[k]), prep::neomme_image_u8)).collect::<Result<_>>()?;
+                        for (&item, (gh, gw, im_patches)) in chunk.iter().zip(ims) {
+                            let (tids, tpos, flags) = prep::neomme_image_layout(gh, gw, ctx.doc_id, ctx.image_id, ctx.row_id);
+                            let np = gh * gw;
                             if np > a.max_patches || tids.len() > a.max_tokens {
                                 bail!("image needs {np} patches / {} tokens: raise --max-patches / --max-tokens", tids.len());
                             }
@@ -443,7 +503,7 @@ fn produce(a: &Args, ctx: &Ctx, raw: &[String], order: &[usize], dir: &Path, que
                                     rows.push(base + t as i32);
                                 }
                             }
-                            patches.extend_from_slice(&im.patches);
+                            patches.extend_from_slice(&im_patches);
                             cu.push(ids.len() as i32);
                             items.push(item);
                         }
