@@ -10,6 +10,11 @@ flashembed is a Rust runner around ONNX Runtime. The models are exported to ONNX
 spots are custom operators written in Rust (a FlashAttention-style tiled kernel with sliding-window tile skipping and
 AVX2/AVX-512 softmax). Tokenization, image/audio/video decoding and preprocessing, batching and pooling are Rust too.
 
+**About the name.** "flash" refers to the attention kernel's algorithm, the tiling and online softmax introduced by
+FlashAttention, reimplemented from scratch in Rust for CPUs. flashembed does not use, wrap or depend on the
+FlashAttention-2/3 libraries (those are CUDA kernels for NVIDIA GPUs), runs on CPUs only, and is not affiliated with
+the FlashAttention project. See [docs/DESIGN.md](docs/DESIGN.md#custom-operators-srcflashrs) for what the kernel does.
+
 ## Results at a glance
 
 Compared with the runtime each model card documents (sentence-transformers / transformers on PyTorch, CPU, FP32) on

@@ -38,7 +38,9 @@ chunked audio attention.
 
 **`flashembed::FlashAttention(Q[B,Hq,S,D], K[B,Hkv,S,D], V[B,Hkv,S,Dv], key_mask[B,S]; scale, window) -> O[B,S,Hq,Dv]`**
 reproduces transformers' eager attention for EmbeddingGemma 2 (text and vision) and NeoMME: score scale, GQA (kv head =
-h / (Hq/Hkv)), key padding, symmetric sliding window |i-j| <= w, fp32 softmax. It is computed FlashAttention-style:
+h / (Hq/Hkv)), key padding, symmetric sliding window |i-j| <= w, fp32 softmax. It is computed FlashAttention-style
+(the tiling + online-softmax algorithm of Dao et al., written from scratch for CPUs; not the FlashAttention-2/3 CUDA
+libraries, which target NVIDIA GPUs):
 64-query x 256-key tiles with an online softmax, so no S x S tensor or dense mask ever exists, and key tiles outside a
 query tile's window are skipped (4 of 5 EmbeddingGemma 2 layers and 14 of 17 NeoMME layers are sliding-window, so long
 inputs cost O(S x window) there instead of O(S^2)). Tile GEMMs use the `gemm` crate (runtime AVX2/AVX-512 dispatch);
