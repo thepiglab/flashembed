@@ -105,7 +105,8 @@ target/release/flashembed embed --model gemma --modality text --input docs.jsonl
 `embeddings.late.npy` plus `embeddings.late_offsets.npy` (row ranges per item). Options: `--modality
 text|image|audio|video`, `--side document|query` (NeoMME), `--threads`, `--batch`, `--max-len`, `--max-soft-tokens`,
 `--dim 768|512|256|128` (EmbeddingGemma 2 Matryoshka size: keeps the leading dimensions and re-normalises, as
-sentence-transformers' `truncate_dim` does; queries and documents must use the same size).
+sentence-transformers' `truncate_dim` does; queries and documents must use the same size), `--no-late` (NeoMME: dense vectors only; no
+late files).
 Text is embedded as given: add the model card's prompt prefix yourself (EmbeddingGemma 2:
 `title: {title} | text: {content}` for documents, `task: search result | query: {q}` for queries).
 `flashembed bench` runs the benchmark harness; `flash-check` tests the attention kernel against an f64 reference.

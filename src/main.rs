@@ -72,6 +72,9 @@ struct EmbedArgs {
     /// and re-normalises, like sentence-transformers' `truncate_dim` + `normalize_embeddings`
     #[arg(long)]
     dim: Option<usize>,
+    /// NeoMME: dense vectors only (no embeddings.late*.npy; late vectors are not kept in memory either)
+    #[arg(long)]
+    no_late: bool,
 }
 
 impl EmbedArgs {
@@ -85,7 +88,7 @@ impl EmbedArgs {
             model: self.model, modality: self.modality, threads, batch: self.batch, n: usize::MAX, warmup: 0, max_len,
             inputs: dir, onnx: self.onnx, snapshot: self.snapshot, out: self.out, save: true, texts_file: file.clone(),
             images_file: file, side: self.side, tag_suffix: String::new(), max_soft_tokens: self.max_soft_tokens,
-            decode_in_loop: true, no_sort: false, plain_names: true, dim: self.dim,
+            decode_in_loop: true, no_sort: false, plain_names: true, dim: self.dim, no_late: self.no_late,
         })
     }
 }
@@ -162,6 +165,9 @@ struct BenchArgs {
     /// EmbeddingGemma 2 Matryoshka output size (768/512/256/128): truncate dense vectors, then re-normalise
     #[arg(long)]
     dim: Option<usize>,
+    /// NeoMME: dense vectors only (skip collecting and writing the late-interaction vectors)
+    #[arg(long)]
+    no_late: bool,
 }
 
 fn oe<T, E: std::fmt::Display>(r: std::result::Result<T, E>) -> Result<T> {
@@ -349,6 +355,7 @@ struct Runner {
     doc_id: i64,
     row_id: i64,
     query: bool,
+    no_late: bool,
     /// seconds inside Session::run (model forward), accumulated; the rest of a batch is Rust prep/post
     infer_s: f64,
 }
@@ -392,7 +399,7 @@ impl Runner {
         Ok(Self {
             _env: env, kind: a.model, modality: a.modality, tok, main, vision, _vision_dyn: vision_dyn, audio,
             mel: media::MelExtractor::new(), soft_budget: a.max_soft_tokens, video_id, audio_id,
-            pad_id, image_id, doc_id, row_id, query, infer_s: 0.0,
+            pad_id, image_id, doc_id, row_id, query, no_late: a.no_late, infer_s: 0.0,
         })
     }
 
@@ -426,7 +433,7 @@ impl Runner {
                     "attention_mask" => oe(Tensor::from_array(([b, s], mask.clone())))?,
                 ]))?;
                 self.infer_s += t.elapsed().as_secs_f64();
-                neomme_outputs(&outs, &mask, b, s)
+                neomme_outputs(&outs, &mask, b, s, self.no_late)
             }
             (ModelKind::Neomme, Modality::Image) => self.neomme_image(items),
             (ModelKind::Neomme, _) => unreachable!(),
@@ -702,11 +709,11 @@ impl Runner {
             "patch_mask" => oe(Tensor::from_array(([b, s], patch_mask)))?,
         ]))?;
         self.infer_s += t.elapsed().as_secs_f64();
-        neomme_outputs(&outs, &mask, b, s)
+        neomme_outputs(&outs, &mask, b, s, self.no_late)
     }
 }
 
-fn neomme_outputs(outs: &ort::session::SessionOutputs, mask: &[i64], b: usize, s: usize) -> Result<BatchOut> {
+fn neomme_outputs(outs: &ort::session::SessionOutputs, mask: &[i64], b: usize, s: usize, no_late: bool) -> Result<BatchOut> {
     let (ds, dense) = oe(outs["dense"].try_extract_tensor::<f32>())?;
     let d = ds[1] as usize;
     let (ls, late) = oe(outs["late"].try_extract_tensor::<f32>())?;
@@ -714,6 +721,10 @@ fn neomme_outputs(outs: &ort::session::SessionOutputs, mask: &[i64], b: usize, s
     let mut out = BatchOut { dense: vec![], late: vec![], late_rows: vec![], ntok: 0 };
     for bi in 0..b {
         out.dense.push(dense[bi * d..(bi + 1) * d].to_vec());
+        if no_late {
+            out.ntok += mask[bi * s..(bi + 1) * s].iter().filter(|&&m| m != 0).count();
+            continue;
+        }
         let mut v = Vec::new();
         let mut n = 0;
         for t in 0..s {
@@ -854,7 +865,7 @@ fn bench(a: BenchArgs) -> Result<()> {
     let ntok: usize = outs.iter().map(|o| o.ntok).sum();
     let res = json!({
         "tag": tag, "runtime": "rust-ort", "model": model, "modality": modality, "threads": a.threads,
-        "batch": a.batch, "dim": a.dim, "n": items.len(), "warmup_batches": a.warmup, "wall_s": wall,
+        "batch": a.batch, "dim": a.dim, "no_late": a.no_late, "n": items.len(), "warmup_batches": a.warmup, "wall_s": wall,
         "items_per_s": items.len() as f64 / wall, "batch_latency_s": lat, "load_s": load_s,
         "peak_rss_mb": peak_rss_mb(), "tokens_total": ntok, "dtype": "float32",
         "infer_s": r.infer_s, "prep_post_s": wall - r.infer_s, "side": a.side, "texts_file": a.texts_file,
