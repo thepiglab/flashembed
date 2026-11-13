@@ -12,6 +12,8 @@
 //!   per tensor (uint8, asymmetric) at run time. `rr` = reduce-range 7-bit weights (ORT's advice for AVX2 without VNNI).
 //! * `qdq8`: static int8: activation ranges from `flashembed calib` (`--calib`), `QuantizeLinear` +
 //!   `com.microsoft::MatMulIntegerToFloat`, int8 per-output-channel weights.
+//! * `q8blk`: `flashembed::QMatMul` (src/qgemm.rs, Rust kernel): int8 weights with a scale per (K-block, column),
+//!   activations quantized per (row, K-block) at run time (8 bits with VNNI, 7 bits on AVX2); `--block` 64 recommended.
 //! * `calib`: the fp32 graph with every selected MatMul's activation input added as a graph output (for `calib`).
 //!
 //! Selection: a MatMul is left fp32 if its torch module path (from the exporter's `pkg.torch.onnx.name_scopes`
@@ -34,6 +36,7 @@ pub const GRAPHS: [&str; 6] = ["gemma_lm", "gemma_vision", "gemma_vision_dyn", "
 const F32: i32 = 1;
 const U8: i32 = 2;
 const I8: i32 = 3;
+const I32: i32 = 6;
 
 /// A loaded graph plus the bytes of its initializers (resolved from raw_data, float_data or external data).
 pub struct Loaded {
@@ -306,6 +309,17 @@ pub fn rewrite(l: &mut Loaded, o: &Opts) -> Result<(usize, Vec<String>)> {
             let attrs = vec![attr_i("K", k as i64), attr_i("N", nn as i64), attr_i("bits", bits as i64),
                              attr_i("block_size", o.block as i64), attr_i("accuracy_level", level)];
             nodes.push(node("MatMulNBits", "com.microsoft", &format!("{nm}_nbits"), &[&a, &bn, &sn], &[&y], attrs));
+        } else if o.scheme == "q8blk" {
+            // flashembed::QMatMul (src/qgemm.rs): int8 weights per (K-block, column), activations per (row, K-block)
+            let pk = crate::qgemm::pack(&w, k, nn, o.block);
+            let nb = pk.kpad / pk.block;
+            let (bn, sn, cn) = (format!("{nm}_qB"), format!("{nm}_qS"), format!("{nm}_qC"));
+            inits.push((tensor(&bn, I8, &[(pk.npad / crate::qgemm::NR) as i64, (pk.kpad / 4) as i64, crate::qgemm::NR as i64, 4]),
+                        pk.b.iter().map(|&x| x as u8).collect()));
+            inits.push((tensor(&sn, F32, &[nb as i64, pk.npad as i64]), pk.sb.iter().flat_map(|x| x.to_le_bytes()).collect()));
+            inits.push((tensor(&cn, I32, &[nb as i64, pk.npad as i64]), pk.cs.iter().flat_map(|x| x.to_le_bytes()).collect()));
+            let attrs = vec![attr_i("K", k as i64), attr_i("N", nn as i64), attr_i("block", o.block as i64)];
+            nodes.push(node("QMatMul", "flashembed", &format!("{nm}_q8"), &[&a, &bn, &sn, &cn], &[&y], attrs));
         } else if o.scheme == "dyn8" || o.scheme == "dyn8rr" {
             let (q, sc) = quant_cols(&w, k, nn, if o.scheme == "dyn8rr" { 63.0 } else { 127.0 });
             let (bn, sn, zn) = (format!("{nm}_qB"), format!("{nm}_qS"), format!("{nm}_qZ"));
@@ -360,6 +374,9 @@ pub fn rewrite(l: &mut Loaded, o: &Opts) -> Result<(usize, Vec<String>)> {
             ..Default::default()
         });
     }
+    if o.scheme == "q8blk" && !l.model.opset_import.iter().any(|o| o.domain() == "flashembed") {
+        l.model.opset_import.push(OperatorSetIdProto { domain: Some("flashembed".into()), version: Some(1) });
+    }
     if !l.model.opset_import.iter().any(|o| o.domain() == "com.microsoft") {
         l.model.opset_import.push(OperatorSetIdProto { domain: Some("com.microsoft".into()), version: Some(1) });
     }
@@ -381,7 +398,7 @@ pub struct QuantizeArgs {
     pub src: PathBuf,
     #[arg(long)]
     pub out: PathBuf,
-    /// nb8-a4 | nb8-a1 | nb4-a4 | nb4-a1 | dyn8 | dyn8rr | qdq8 | calib
+    /// nb8-a4 | nb8-a1 | nb4-a4 | nb4-a1 | dyn8 | dyn8rr | qdq8 | q8blk | calib
     #[arg(long)]
     pub scheme: String,
     /// graphs to rewrite; the others are symlinked to the fp32 files

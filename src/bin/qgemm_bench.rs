@@ -40,7 +40,7 @@ fn model(m: usize, k: usize, n: usize, w: &[f32], scheme: &str, xrange: (f32, f3
     let mut l = quant::Loaded { model: mdl, data: [("W".to_string(), w.iter().flat_map(|x| x.to_le_bytes()).collect())].into() };
     if scheme != "fp32" {
         let calib = (scheme == "qdq8").then(|| [("X".to_string(), quant::Range { lo: xrange.0, hi: xrange.1, lo_avg: xrange.0, hi_avg: xrange.1, batches: 1 })].into());
-        quant::rewrite(&mut l, &quant::Opts { scheme: scheme.into(), block: 32, keep: None, keep_edge: 0, calib, calib_avg: false })?;
+        quant::rewrite(&mut l, &quant::Opts { scheme: scheme.into(), block: if scheme == "q8blk" { 64 } else { 32 }, keep: None, keep_edge: 0, calib, calib_avg: false })?;
     }
     // inline all initializers
     let g = l.model.graph.as_mut().unwrap();
@@ -123,7 +123,7 @@ fn main() -> anyhow::Result<()> {
         println!("{}", serde_json::json!({"probe": "single-core peak", "results": p}));
     }
     let env = ort::init_from(std::env::var("ORT_DYLIB_PATH")?).map_err(|e| anyhow::anyhow!("{e}"))?.build().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let schemes = ["fp32", "dyn8", "dyn8rr", "qdq8", "nb8-a1", "nb8-a4", "nb4-a1", "nb4-a4"];
+    let schemes = ["fp32", "dyn8", "dyn8rr", "qdq8", "nb8-a1", "nb8-a4", "nb4-a1", "nb4-a4", "q8blk"];
     for (m, k, n) in shapes {
         // activations with a few large channels, like the models' hidden states
         let x: Vec<f32> = (0..m * k).map(|i| { let v = ((i * 7919) % 1000) as f32 * 2e-3 - 1.0; if i % k < 4 { v * 30.0 } else { v } }).collect();
@@ -137,7 +137,8 @@ fn main() -> anyhow::Result<()> {
                 .with_optimization_level(GraphOptimizationLevel::Level3).map_err(|e| anyhow::anyhow!("{e}"))?
                 .with_intra_threads(t).map_err(|e| anyhow::anyhow!("{e}"))?
                 .with_inter_threads(1).map_err(|e| anyhow::anyhow!("{e}"))?
-                .with_config_entry("session.intra_op.allow_spinning", "0").map_err(|e| anyhow::anyhow!("{e}"))?;
+                .with_config_entry("session.intra_op.allow_spinning", "0").map_err(|e| anyhow::anyhow!("{e}"))?
+                .with_operators(flashembed::flash::domain().map_err(|e| anyhow::anyhow!("{e}"))?).map_err(|e| anyhow::anyhow!("{e}"))?;
             let mut s = match b.commit_from_memory(&bytes) {
                 Ok(s) => s,
                 Err(e) => { println!("{}", serde_json::json!({"scheme": sch, "shape": format!("{m}x{k}x{n}"), "error": e.to_string()})); continue; }

@@ -8,3 +8,4 @@ pub mod gpu;
 pub mod quant;
 pub mod fidelity;
 pub mod qreport;
+pub mod qgemm;
