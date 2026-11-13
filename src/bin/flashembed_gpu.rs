@@ -15,7 +15,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use flashembed::gpu::{self, Arch, Dtype, Engine};
-use flashembed::prep;
+use flashembed::{media, prep};
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
 use serde_json::json;
@@ -41,6 +41,10 @@ enum Model {
 enum Modality {
     Text,
     Image,
+    /// EmbeddingGemma 2 only: ffmpeg decode at 1 fps, <= 32 frames, 140 soft tokens per frame
+    Video,
+    /// EmbeddingGemma 2 only: ffmpeg decode to 16 kHz mono (first 30 s), log-mel, Gemma 4 audio conformer
+    Audio,
 }
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
 enum Dt {
@@ -96,6 +100,9 @@ struct Args {
     /// write embeddings.* (default) or <tag>.* file names
     #[arg(long, default_value = "embeddings")]
     tag: String,
+    /// audio: log-mel frames per forward (100 per second; a 30 s clip is 3,000)
+    #[arg(long, default_value_t = 12000)]
+    max_frames: usize,
     /// narrow-precision layer GEMMs (with --dtype bf16): none, fp8 (MXFP8: E4M3 + UE8M0 scale per 32 values) or
     /// nvfp4 (E2M1 + UE4M3 scale per 16 values); attention, norms and the residual stream are unchanged
     #[arg(long, default_value = "none")]
@@ -130,6 +137,11 @@ enum Batch {
     Text { ids: Vec<i32>, cu: Vec<i32>, items: Vec<usize> },
     /// EmbeddingGemma 2 images: either host-preprocessed float patches, or (dev) decoded RGB8 sources + resize
     /// descriptors for GPU-side preprocessing
+    /// EmbeddingGemma 2 audio clips: log-mel features + per-stage row maps (fe_gemma_audio), then the text rows
+    Audio {
+        cu0: Vec<i32>, feats: Vec<f32>, m0: Vec<i32>, rows1: Vec<i32>, m1: Vec<i32>, rows2: Vec<i32>, m2: Vec<i32>, soft_rows: Vec<i32>,
+        ids: Vec<i32>, cu: Vec<i32>, mm: Vec<i32>, items: Vec<usize>,
+    },
     GemmaImage {
         vcu: Vec<i32>, pos: Vec<i32>, patches: Vec<f32>, slot_ptr: Vec<i32>, slot_patch: Vec<i32>, ids: Vec<i32>, cu: Vec<i32>,
         mm: Vec<i32>, items: Vec<usize>, dev: bool, src: Vec<u8>, desc: Vec<i32>, coef: Vec<i32>, tmp: usize, max_pix: usize,
@@ -140,6 +152,10 @@ enum Batch {
 struct Ctx {
     tok: tokenizers::Tokenizer,
     image_id: i64,
+    video_id: i64,
+    audio_id: i64,
+    boa: i64,
+    eoa: i64,
     boi: i64,
     eoi: i64,
     doc_id: i64,
@@ -189,7 +205,9 @@ fn run(a: Args) -> Result<()> {
         Model::Neomme => (prep::token_id(&tok, "<img>")?, prep::token_id(&tok, "<doc>")?, prep::token_id(&tok, "<row>")?, -1, -1),
     };
     let specials = prep::encode(&tok, &[String::new()], true)?.remove(0);
-    let ctx = Ctx { tok, image_id, boi, eoi, doc_id, row_id, specials };
+    let tid = |t: &str| if a.model == Model::Gemma { prep::token_id(&tok, t) } else { Ok(-1) };
+    let (video_id, audio_id, boa, eoa) = (tid("<|video|>")?, tid("<|audio|>")?, tid("<|audio>")?, tid("<audio|>")?);
+    let ctx = Ctx { tok, image_id, video_id, audio_id, boa, eoa, boi, eoi, doc_id, row_id, specials };
 
     let mut a = a;
     let max_tokens = a.max_tokens.unwrap_or(if gpu::smem_optin() >= 200 * 1024 { 32768 } else { 8192 });
@@ -198,6 +216,10 @@ fn run(a: Args) -> Result<()> {
         (Modality::Text, _) => 0,
         (Modality::Image, Model::Gemma) => a.max_patches.unwrap_or(40320),
         (Modality::Image, Model::Neomme) => a.max_patches.unwrap_or(16384),
+        // one full 32-frame video (32 x 1260 patches) per batch at least
+        (Modality::Video, Model::Gemma) => a.max_patches.unwrap_or(40320),
+        (Modality::Audio, Model::Gemma) => 0,
+        (_, Model::Neomme) => bail!("NeoMME-260M-Retriever has no {:?} encoder (text and images only)", a.modality),
     };
     a.max_patches = Some(max_patches);
     let a = a;
@@ -205,9 +227,10 @@ fn run(a: Args) -> Result<()> {
         return prep_only(&a, &ctx, &raw, &dir, query);
     }
     let t_load = Instant::now();
-    let vision = a.model == Model::Gemma && a.modality == Modality::Image;
+    let vision = a.model == Model::Gemma && matches!(a.modality, Modality::Image | Modality::Video);
     let quant = match a.quant.as_str() { "none" => 0, "fp8" => 1, "nvfp4" => 2, q => bail!("--quant {q}: none|fp8|nvfp4") };
-    let mut eng = Engine::load(&a.snapshot, arch, dtype, vision, max_tokens, max_patches, a.img_mb << 20, quant)?;
+    let audio_frames = if a.modality == Modality::Audio { a.max_frames } else { 0 };
+    let mut eng = Engine::load(&a.snapshot, arch, dtype, vision, max_tokens, max_patches, a.img_mb << 20, quant, audio_frames)?;
     let load_s = t_load.elapsed().as_secs_f64();
     let mem_loaded = eng.mem()?;
     let out_dim = eng.out_dim;
@@ -218,7 +241,13 @@ fn run(a: Args) -> Result<()> {
     if a.modality == Modality::Text {
         order.sort_by_key(|&i| std::cmp::Reverse(raw[i].chars().count()));
     } else {
-        let px: Vec<usize> = raw.par_iter().map(|p| image::image_dimensions(dir.join(p)).map(|(w, h)| (w * h) as usize).unwrap_or(0)).collect();
+        let px: Vec<usize> = raw
+            .par_iter()
+            .map(|p| match a.modality {
+                Modality::Image => image::image_dimensions(dir.join(p)).map(|(w, h)| (w * h) as usize).unwrap_or(0),
+                _ => std::fs::metadata(dir.join(p)).map(|m| m.len() as usize).unwrap_or(0),
+            })
+            .collect();
         order.sort_by_key(|&i| std::cmp::Reverse(px[i]));
     }
 
@@ -252,7 +281,7 @@ fn run(a: Args) -> Result<()> {
                 gpu_s += dt;
                 nb += 1;
                 let (items, ntok) = match &b {
-                    Batch::Text { items, ids, .. } | Batch::NeoImage { items, ids, .. } | Batch::GemmaImage { items, ids, .. } => (items, ids.len()),
+                    Batch::Text { items, ids, .. } | Batch::NeoImage { items, ids, .. } | Batch::GemmaImage { items, ids, .. } | Batch::Audio { items, ids, .. } => (items, ids.len()),
                 };
                 ntok_total += ntok;
                 let od = res.0.len() / items.len();
@@ -260,7 +289,7 @@ fn run(a: Args) -> Result<()> {
                     dense[it] = res.0[j * od..(j + 1) * od].to_vec();
                 }
                 if want_late {
-                    let cu = match &b { Batch::Text { cu, .. } | Batch::NeoImage { cu, .. } | Batch::GemmaImage { cu, .. } => cu };
+                    let cu = match &b { Batch::Text { cu, .. } | Batch::NeoImage { cu, .. } | Batch::GemmaImage { cu, .. } | Batch::Audio { cu, .. } => cu };
                     for (j, &it) in items.iter().enumerate() {
                         late[it] = res.1[cu[j] as usize * 128..cu[j + 1] as usize * 128].to_vec();
                     }
@@ -326,7 +355,7 @@ fn prep_only(a: &Args, ctx: &Ctx, raw: &[String], dir: &Path, query: bool) -> Re
         });
         for b in rx {
             match b? {
-                Batch::Text { ids, .. } | Batch::NeoImage { ids, .. } | Batch::GemmaImage { ids, .. } => ntok += ids.len(),
+                Batch::Text { ids, .. } | Batch::NeoImage { ids, .. } | Batch::GemmaImage { ids, .. } | Batch::Audio { ids, .. } => ntok += ids.len(),
             }
             nb += 1;
         }
@@ -355,6 +384,10 @@ fn execute(eng: &mut Engine, b: &Batch, late: bool) -> Result<(Vec<f32>, Vec<f32
             Ok((eng.gemma_text(ids, cu, Some(mm))?, vec![]))
         }
         Batch::NeoImage { ids, cu, pos, patches, rows, .. } => eng.neomme(ids, cu, Some(pos), patches, rows, late),
+        Batch::Audio { cu0, feats, m0, rows1, m1, rows2, m2, soft_rows, ids, cu, mm, .. } => {
+            eng.gemma_audio(cu0, feats, m0, rows1, m1, rows2, m2, soft_rows)?;
+            Ok((eng.gemma_text(ids, cu, Some(mm))?, vec![]))
+        }
     }
 }
 
@@ -394,7 +427,91 @@ fn produce(a: &Args, ctx: &Ctx, raw: &[String], order: &[usize], dir: &Path, que
                 tx.send(Ok(Batch::Text { ids: cur.0, cu: cur.1, items: cur.2 }))?;
             }
         }
-        Modality::Image => {
+        Modality::Audio => {
+            if a.model != Model::Gemma {
+                bail!("audio is EmbeddingGemma 2 only");
+            }
+            let mel = media::MelExtractor::new();
+            let new_audio = || Batch::Audio {
+                cu0: vec![0], feats: vec![], m0: vec![], rows1: vec![], m1: vec![], rows2: vec![], m2: vec![], soft_rows: vec![],
+                ids: vec![], cu: vec![0], mm: vec![], items: vec![],
+            };
+            let mut ab: Option<Batch> = None;
+            for chunk in order.chunks(32) {
+                // decode (first 30 s + 0.25 s, as the CPU runner) and log-mel per clip, in parallel
+                let clips: Vec<(Vec<f32>, Vec<bool>)> = chunk
+                    .par_iter()
+                    .map(|&k| {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let t = Instant::now();
+                        let wav = media::decode_audio(&dir.join(&raw[k]), Some(480_000))?;
+                        DECODE_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                        let t = Instant::now();
+                        let (len, valid) = media::pad_batch(std::slice::from_ref(&wav));
+                        let mut x = wav[..valid[0]].to_vec();
+                        x.resize(len, 0.0);
+                        let r = mel.features(&x, valid[0]);
+                        PREP_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                        Ok(r)
+                    })
+                    .collect::<Result<_>>()?;
+                for (&item, (f, mk)) in chunk.iter().zip(clips) {
+                    let t0 = mk.len();
+                    // the two stride-2 subsampling stages: t_out = (t_in + 2 - 3) / 2 + 1, mask[::2]
+                    let sub = |m: &[bool]| -> Vec<bool> { m.iter().step_by(2).take((m.len() + 2 - 3) / 2 + 1).copied().collect() };
+                    let mk1 = sub(&mk);
+                    let mk2 = sub(&mk1);
+                    let nsoft = mk2.iter().filter(|&&b| b).count();
+                    let mut mid = vec![ctx.boa];
+                    mid.extend(std::iter::repeat_n(ctx.audio_id, nsoft));
+                    mid.push(ctx.eoa);
+                    let row = wrap(ctx, &mid);
+                    if t0 > a.max_frames || row.len() > max_tokens_of(a) {
+                        bail!("{}: {t0} frames / {} tokens exceed --max-frames / --max-tokens", raw[item], row.len());
+                    }
+                    let flush = matches!(&ab, Some(Batch::Audio { cu0, ids, items, .. })
+                        if *cu0.last().unwrap() as usize + t0 > a.max_frames || ids.len() + row.len() > max_tokens_of(a) || items.len() >= a.max_items);
+                    if flush {
+                        tx.send(Ok(ab.take().unwrap()))?;
+                    }
+                    let Batch::Audio { cu0, feats, m0, rows1, m1, rows2, m2, soft_rows, ids, cu, mm, items } = ab.get_or_insert_with(new_audio) else {
+                        unreachable!()
+                    };
+                    let (b0, b1, b2) = (*cu0.last().unwrap(), m1.len() as i32, m2.len() as i32);
+                    feats.extend_from_slice(&f);
+                    m0.extend(mk.iter().map(|&b| b as i32));
+                    cu0.push(b0 + t0 as i32);
+                    for (lt, &b) in mk1.iter().enumerate() {
+                        rows1.extend([b0, t0 as i32, lt as i32]);
+                        m1.push(b as i32);
+                    }
+                    for (lt, &b) in mk2.iter().enumerate() {
+                        rows2.extend([b1, mk1.len() as i32, lt as i32, b2, mk2.len() as i32]);
+                        m2.push(b as i32);
+                        if b {
+                            soft_rows.push(b2 + lt as i32);
+                        }
+                    }
+                    let soft_base = (soft_rows.len() - nsoft) as i32;
+                    let mut k = 0;
+                    for &t in &row {
+                        if t as i64 == ctx.audio_id {
+                            mm.push(soft_base + k);
+                            k += 1;
+                        } else {
+                            mm.push(-1);
+                        }
+                    }
+                    ids.extend(row);
+                    cu.push(ids.len() as i32);
+                    items.push(item);
+                }
+            }
+            if let Some(b) = ab {
+                tx.send(Ok(b))?;
+            }
+        }
+        Modality::Image | Modality::Video => {
             // decode + preprocess chunks of images in parallel, then pack them into batches under the patch,
             // token and item budgets
             let mut gb: Option<Batch> = None;
@@ -408,40 +525,81 @@ fn produce(a: &Args, ctx: &Ctx, raw: &[String], order: &[usize], dir: &Path, que
             for chunk in order.chunks(64) {
                 match a.model {
                     Model::Gemma => {
-                        // GPU preprocessing: decode on the CPU, resize + patch on the GPU (images too large for the
-                        // byte budget fall back to CPU preprocessing)
-                        let ims: Vec<GPrep> = chunk
+                        // GPU preprocessing: decode on the CPU, resize + patch on the GPU (items whose decoded frames
+                        // exceed the byte budget fall back to CPU preprocessing). An image is one frame at 280 soft
+                        // tokens; a video is <= 32 frames sampled at 1 fps at 140 soft tokens each
+                        // (EmbeddingGemma2VideoProcessor defaults, as in the CPU runner).
+                        let video = a.modality == Modality::Video;
+                        let soft_budget = if video { 140 } else { prep::G_SOFT };
+                        let prep_frames = |ims: Vec<image::RgbImage>| -> Result<Vec<GPrep>> {
+                            let tmp_total: usize = ims
+                                .iter()
+                                .map(|im| gpu::ImagePlan::new(im.width() as usize, im.height() as usize, soft_budget * 9).map(|p| p.tmp_bytes).unwrap_or(usize::MAX))
+                                .fold(0usize, |a, b| a.saturating_add(b));
+                            // a whole item (all frames of a video) must fit one batch's GPU byte budget, else it is
+                            // preprocessed on the CPU (e.g. 32 frames of 1080p video, ~200 MB decoded)
+                            let host = img_budget == 0 || ims.iter().map(|im| im.as_raw().len()).sum::<usize>() > img_budget;
+                            ims.into_iter()
+                                .map(|im| {
+                                    if !host && tmp_total <= img_budget {
+                                        let plan = gpu::ImagePlan::new(im.width() as usize, im.height() as usize, soft_budget * 9)?;
+                                        return Ok(GPrep::Dev(plan, im.into_raw()));
+                                    }
+                                    Ok(GPrep::Host(prep::gemma_image_budget(&im, soft_budget)?))
+                                })
+                                .collect()
+                        };
+                        let items_frames: Vec<Vec<GPrep>> = chunk
                             .par_iter()
                             .map(|&k| {
                                 let path = dir.join(&raw[k]);
-                                if img_budget == 0 {
-                                    return timed_image(&path, |im| Ok(GPrep::Host(prep::gemma_image(im)?)));
-                                }
-                                timed_image(&path, |im| {
-                                    let plan = gpu::ImagePlan::new(im.width() as usize, im.height() as usize, prep::G_MAX_PATCHES)?;
-                                    if im.as_raw().len() > img_budget || plan.tmp_bytes > img_budget {
-                                        return Ok(GPrep::Host(prep::gemma_image(im)?));
-                                    }
-                                    Ok(GPrep::Dev(plan, im.as_raw().clone()))
-                                })
+                                use std::sync::atomic::Ordering::Relaxed;
+                                let t = Instant::now();
+                                let ims = if video {
+                                    let m = media::probe_video(&path)?;
+                                    let idx = media::sample_indices(&m, 1.0, 32);
+                                    media::decode_frames(&path, &m, &idx)?
+                                } else {
+                                    vec![prep::load_rgb(&path)?]
+                                };
+                                DECODE_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                                let t = Instant::now();
+                                let r = prep_frames(ims);
+                                PREP_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                                r
                             })
                             .collect::<Result<_>>()?;
-                        for (&item, g) in chunk.iter().zip(ims) {
-                            let (dev, np, pw_patch) = match &g {
-                                GPrep::Host(h) => (false, h.n_soft * 9, 0),
-                                GPrep::Dev(p, _) => (true, (p.tw / 16) * (p.th / 16), p.tw / 16),
-                            };
-                            let n_soft = np / 9;
-                            let mut mid = vec![ctx.boi];
-                            mid.extend(std::iter::repeat_n(ctx.image_id, n_soft));
-                            mid.push(ctx.eoi);
-                            let row = wrap(ctx, &mid);
-                            if np > maxp || row.len() > max_tokens_of(a) {
-                                bail!("image needs {np} patches / {} tokens: raise --max-patches / --max-tokens", row.len());
+                        let mm_tok = if video { ctx.video_id } else { ctx.image_id };
+                        for (&item, frames) in chunk.iter().zip(items_frames) {
+                            if frames.is_empty() {
+                                bail!("{}: no frames decoded", raw[item]);
                             }
-                            let (sb, tb) = match &g { GPrep::Dev(p, src) => (src.len(), p.tmp_bytes), _ => (0, 0) };
+                            let dev = matches!(frames[0], GPrep::Dev(..));
+                            let geo: Vec<(usize, usize)> = frames
+                                .iter()
+                                .map(|g| match g {
+                                    GPrep::Host(h) => (h.n_soft * 9, 0),
+                                    GPrep::Dev(p, _) => ((p.tw / 16) * (p.th / 16), p.tw / 16),
+                                })
+                                .collect();
+                            let np_all: usize = geo.iter().map(|x| x.0).sum();
+                            // EmbeddingGemma2Processor: boi + mm * n + eoi per frame, frames concatenated
+                            let mut mid = vec![];
+                            for &(np, _) in &geo {
+                                mid.push(ctx.boi);
+                                mid.extend(std::iter::repeat_n(mm_tok, np / 9));
+                                mid.push(ctx.eoi);
+                            }
+                            let row = wrap(ctx, &mid);
+                            if np_all > maxp || row.len() > max_tokens_of(a) {
+                                bail!("{} needs {np_all} patches / {} tokens: raise --max-patches / --max-tokens", raw[item], row.len());
+                            }
+                            let (sb, tb) = frames.iter().fold((0, 0), |acc, g| match g {
+                                GPrep::Dev(p, src) => (acc.0 + src.len(), acc.1 + p.tmp_bytes),
+                                _ => acc,
+                            });
                             let flush = matches!(&gb, Some(Batch::GemmaImage { vcu, ids, items, dev: d, src, tmp, .. })
-                                if *vcu.last().unwrap() as usize + np > maxp || ids.len() + row.len() > max_tokens_of(a)
+                                if *vcu.last().unwrap() as usize + np_all > maxp || ids.len() + row.len() > max_tokens_of(a)
                                     || items.len() >= a.max_items || *d != dev || src.len() + sb > img_budget || *tmp + tb > img_budget);
                             if flush {
                                 tx.send(Ok(gb.take().unwrap()))?;
@@ -451,42 +609,45 @@ fn produce(a: &Args, ctx: &Ctx, raw: &[String], order: &[usize], dir: &Path, que
                             else {
                                 unreachable!()
                             };
-                            let p0 = *vcu.last().unwrap();
-                            // patch p = r * pw + c sits at (x, y) = (c, r); pooling slot = (x / 3) + (pw / 3) * (y / 3)
-                            // (HF _avg_pool_by_positions with k = 3)
-                            let xy: Vec<(usize, usize)> = match &g {
-                                GPrep::Host(h) => (0..np).map(|p| (h.positions[2 * p] as usize, h.positions[2 * p + 1] as usize)).collect(),
-                                GPrep::Dev(..) => (0..np).map(|p| (p % pw_patch, p / pw_patch)).collect(),
-                            };
-                            let pw = xy.iter().map(|q| q.0).max().unwrap_or(0) + 1;
-                            let mut slots: Vec<Vec<i32>> = vec![vec![]; n_soft];
-                            for (p, &(x, y)) in xy.iter().enumerate() {
-                                let s = x / 3 + (pw / 3) * (y / 3);
-                                if s >= n_soft {
-                                    bail!("pooling slot {s} out of range {n_soft}");
-                                }
-                                slots[s].push(p0 + p as i32);
-                                pos.push(x as i32);
-                                pos.push(y as i32);
-                            }
                             let soft_base = (slot_ptr.len() - 1) as i32;
-                            for s in slots {
-                                slot_patch.extend(s);
-                                slot_ptr.push(slot_patch.len() as i32);
-                            }
-                            match g {
-                                GPrep::Host(h) => patches.extend_from_slice(&h.patches[..np * prep::G_PATCH_DIM]),
-                                GPrep::Dev(plan, bytes) => {
-                                    plan.append(src.len(), *tmp, p0 as usize, desc, coef);
-                                    src.extend_from_slice(&bytes);
-                                    *tmp += plan.tmp_bytes;
-                                    *max_pix = (*max_pix).max(plan.max_pix);
+                            for (g, &(np, pw_patch)) in frames.into_iter().zip(&geo) {
+                                let n_soft = np / 9;
+                                let p0 = *vcu.last().unwrap();
+                                // patch p = r * pw + c sits at (x, y) = (c, r); pooling slot = (x / 3) + (pw / 3) * (y / 3)
+                                // (HF _avg_pool_by_positions with k = 3)
+                                let xy: Vec<(usize, usize)> = match &g {
+                                    GPrep::Host(h) => (0..np).map(|p| (h.positions[2 * p] as usize, h.positions[2 * p + 1] as usize)).collect(),
+                                    GPrep::Dev(..) => (0..np).map(|p| (p % pw_patch, p / pw_patch)).collect(),
+                                };
+                                let pw = xy.iter().map(|q| q.0).max().unwrap_or(0) + 1;
+                                let mut slots: Vec<Vec<i32>> = vec![vec![]; n_soft];
+                                for (p, &(x, y)) in xy.iter().enumerate() {
+                                    let sl = x / 3 + (pw / 3) * (y / 3);
+                                    if sl >= n_soft {
+                                        bail!("pooling slot {sl} out of range {n_soft}");
+                                    }
+                                    slots[sl].push(p0 + p as i32);
+                                    pos.push(x as i32);
+                                    pos.push(y as i32);
                                 }
+                                for sl in slots {
+                                    slot_patch.extend(sl);
+                                    slot_ptr.push(slot_patch.len() as i32);
+                                }
+                                match g {
+                                    GPrep::Host(h) => patches.extend_from_slice(&h.patches[..np * prep::G_PATCH_DIM]),
+                                    GPrep::Dev(plan, bytes) => {
+                                        plan.append(src.len(), *tmp, p0 as usize, desc, coef);
+                                        src.extend_from_slice(&bytes);
+                                        *tmp += plan.tmp_bytes;
+                                        *max_pix = (*max_pix).max(plan.max_pix);
+                                    }
+                                }
+                                vcu.push(p0 + np as i32);
                             }
-                            vcu.push(p0 + np as i32);
                             let mut k = 0;
                             for &t in &row {
-                                if t as i64 == ctx.image_id {
+                                if t as i64 == mm_tok {
                                     mm.push(soft_base + k);
                                     k += 1;
                                 } else {
