@@ -2463,6 +2463,9 @@ int fe_mem(void* h, uint64_t* out) {
   });
 }
 
+// opt-in shared memory per block of the current GPU (B200: 227 KB, RTX PRO 6000 Blackwell: 99 KB)
+int fe_smem_optin() { return smem_optin(); }
+
 int fe_device_name(char* buf, int n) {
   return guard([&] {
     int d = 0;

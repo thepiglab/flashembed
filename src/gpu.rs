@@ -29,6 +29,7 @@ unsafe extern "C" {
     ) -> c_int;
     fn fe_mem(h: *mut c_void, out: *mut u64) -> c_int;
     fn fe_device_name(buf: *mut c_char, n: c_int) -> c_int;
+    fn fe_smem_optin() -> c_int;
     fn fe_free(h: *mut c_void);
 }
 
@@ -74,6 +75,11 @@ pub struct MemInfo {
     pub arena: u64,
     pub device_used: u64,
     pub device_total: u64,
+}
+
+/// Opt-in shared memory per block (bytes) of the current GPU.
+pub fn smem_optin() -> usize {
+    unsafe { fe_smem_optin() }.max(0) as usize
 }
 
 pub fn device_name() -> String {

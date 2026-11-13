@@ -62,12 +62,14 @@ struct Args {
     snapshot: PathBuf,
     #[arg(long, value_enum, default_value = "bf16")]
     dtype: Dt,
-    /// token budget per forward (packed, no padding); also sizes the activation arena
-    #[arg(long, default_value_t = 32768)]
-    max_tokens: usize,
-    /// image patch budget per forward (EmbeddingGemma 2 vision tower / NeoMME patch stem)
-    #[arg(long, default_value_t = 40320)]
-    max_patches: usize,
+    /// token budget per forward (packed, no padding); also sizes the activation arena. Default: 32768 on GPUs with
+    /// B200-class shared memory (measured fastest there), 8192 elsewhere (RTX PRO 6000: faster and 4x less memory)
+    #[arg(long)]
+    max_tokens: Option<usize>,
+    /// image patch budget per forward (EmbeddingGemma 2 vision tower: default 40320 = 16 images at 280 soft tokens;
+    /// NeoMME patch stem: default 16384, at least 4096 = one 2048 x 2048 page); unused for text
+    #[arg(long)]
+    max_patches: Option<usize>,
     /// EmbeddingGemma 2: MB of decoded images per batch for GPU-side resize + patching (0 = preprocess on the CPU)
     #[arg(long, default_value_t = 128)]
     img_mb: usize,
@@ -185,12 +187,22 @@ fn run(a: Args) -> Result<()> {
     let specials = prep::encode(&tok, &[String::new()], true)?.remove(0);
     let ctx = Ctx { tok, image_id, boi, eoi, doc_id, row_id, specials };
 
+    let mut a = a;
+    let max_tokens = a.max_tokens.unwrap_or(if gpu::smem_optin() >= 200 * 1024 { 32768 } else { 8192 });
+    a.max_tokens = Some(max_tokens);
+    let max_patches = match (a.modality, a.model) {
+        (Modality::Text, _) => 0,
+        (Modality::Image, Model::Gemma) => a.max_patches.unwrap_or(40320),
+        (Modality::Image, Model::Neomme) => a.max_patches.unwrap_or(16384),
+    };
+    a.max_patches = Some(max_patches);
+    let a = a;
     if a.prep_only {
         return prep_only(&a, &ctx, &raw, &dir, query);
     }
     let t_load = Instant::now();
     let vision = a.model == Model::Gemma && a.modality == Modality::Image;
-    let mut eng = Engine::load(&a.snapshot, arch, dtype, vision, a.max_tokens, a.max_patches, a.img_mb << 20)?;
+    let mut eng = Engine::load(&a.snapshot, arch, dtype, vision, max_tokens, max_patches, a.img_mb << 20)?;
     let load_s = t_load.elapsed().as_secs_f64();
     let mem_loaded = eng.mem()?;
     let out_dim = eng.out_dim;
@@ -281,7 +293,7 @@ fn run(a: Args) -> Result<()> {
     std::fs::write(a.out.join(format!("{}.ids.json", a.tag)), serde_json::to_string(&ids_out)?)?;
     let res = json!({
         "runtime": "flashembed-gpu", "model": format!("{:?}", a.model).to_lowercase(), "modality": format!("{:?}", a.modality).to_lowercase(),
-        "dtype": format!("{:?}", a.dtype).to_lowercase(), "n": n, "batches": nb, "max_tokens": a.max_tokens, "max_patches": a.max_patches,
+        "dtype": format!("{:?}", a.dtype).to_lowercase(), "n": n, "batches": nb, "max_tokens": max_tokens, "max_patches": max_patches,
         "max_items": a.max_items, "max_len": max_len, "warmup": a.warmup, "wall_s": wall, "items_per_s": n as f64 / wall,
         "tokens": ntok_total, "tokens_per_s": ntok_total as f64 / wall, "gpu_call_s": gpu_s, "load_s": load_s,
         "total_s": t_start.elapsed().as_secs_f64(),
@@ -361,12 +373,12 @@ fn produce(a: &Args, ctx: &Ctx, raw: &[String], order: &[usize], dir: &Path, que
                     })
                     .collect::<Result<_>>()?;
                 for (&i, r) in chunk.iter().zip(rows) {
-                    if !cur.2.is_empty() && (cur.0.len() + r.len() > a.max_tokens || cur.2.len() >= a.max_items) {
+                    if !cur.2.is_empty() && (cur.0.len() + r.len() > max_tokens_of(a) || cur.2.len() >= a.max_items) {
                         let b = std::mem::replace(&mut cur, (vec![], vec![0], vec![]));
                         tx.send(Ok(Batch::Text { ids: b.0, cu: b.1, items: b.2 }))?;
                     }
-                    if r.len() > a.max_tokens {
-                        bail!("item of {} tokens exceeds --max-tokens {}", r.len(), a.max_tokens);
+                    if r.len() > max_tokens_of(a) {
+                        bail!("item of {} tokens exceeds --max-tokens {}", r.len(), max_tokens_of(a));
                     }
                     cur.0.extend_from_slice(&r);
                     cur.1.push(cur.0.len() as i32);
@@ -387,6 +399,7 @@ fn produce(a: &Args, ctx: &Ctx, raw: &[String], order: &[usize], dir: &Path, que
             };
             let new_neo = || Batch::NeoImage { ids: vec![], cu: vec![0], pos: vec![], patches: vec![], rows: vec![], items: vec![] };
             let img_budget = a.img_mb << 20;
+            let maxp = a.max_patches.unwrap_or(0);
             for chunk in order.chunks(64) {
                 match a.model {
                     Model::Gemma => {
@@ -418,12 +431,12 @@ fn produce(a: &Args, ctx: &Ctx, raw: &[String], order: &[usize], dir: &Path, que
                             mid.extend(std::iter::repeat_n(ctx.image_id, n_soft));
                             mid.push(ctx.eoi);
                             let row = wrap(ctx, &mid);
-                            if np > a.max_patches || row.len() > a.max_tokens {
+                            if np > maxp || row.len() > max_tokens_of(a) {
                                 bail!("image needs {np} patches / {} tokens: raise --max-patches / --max-tokens", row.len());
                             }
                             let (sb, tb) = match &g { GPrep::Dev(p, src) => (src.len(), p.tmp_bytes), _ => (0, 0) };
                             let flush = matches!(&gb, Some(Batch::GemmaImage { vcu, ids, items, dev: d, src, tmp, .. })
-                                if *vcu.last().unwrap() as usize + np > a.max_patches || ids.len() + row.len() > a.max_tokens
+                                if *vcu.last().unwrap() as usize + np > maxp || ids.len() + row.len() > max_tokens_of(a)
                                     || items.len() >= a.max_items || *d != dev || src.len() + sb > img_budget || *tmp + tb > img_budget);
                             if flush {
                                 tx.send(Ok(gb.take().unwrap()))?;
@@ -485,11 +498,11 @@ fn produce(a: &Args, ctx: &Ctx, raw: &[String], order: &[usize], dir: &Path, que
                         for (&item, (gh, gw, im_patches)) in chunk.iter().zip(ims) {
                             let (tids, tpos, flags) = prep::neomme_image_layout(gh, gw, ctx.doc_id, ctx.image_id, ctx.row_id);
                             let np = gh * gw;
-                            if np > a.max_patches || tids.len() > a.max_tokens {
+                            if np > maxp || tids.len() > max_tokens_of(a) {
                                 bail!("image needs {np} patches / {} tokens: raise --max-patches / --max-tokens", tids.len());
                             }
                             let flush = matches!(&gb, Some(Batch::NeoImage { ids, rows, items, .. })
-                                if rows.len() + np > a.max_patches || ids.len() + tids.len() > a.max_tokens || items.len() >= a.max_items);
+                                if rows.len() + np > maxp || ids.len() + tids.len() > max_tokens_of(a) || items.len() >= a.max_items);
                             if flush {
                                 tx.send(Ok(gb.take().unwrap()))?;
                             }
@@ -516,4 +529,8 @@ fn produce(a: &Args, ctx: &Ctx, raw: &[String], order: &[usize], dir: &Path, que
         }
     }
     Ok(())
+}
+
+fn max_tokens_of(a: &Args) -> usize {
+    a.max_tokens.unwrap_or(32768)
 }

@@ -5,7 +5,33 @@ flashembed's GPU path is a native CUDA engine (`cuda/fegpu.cu`), driven from Rus
 It produces the same vectors as the model-card runtimes on GPU (sentence-transformers for EmbeddingGemma 2,
 transformers `NeoMMEForRetrieval` for NeoMME-260M-Retriever) and is faster and lighter than them.
 
-RESULTS_PLACEHOLDER
+## Results
+
+Same inputs on both sides: 4,000 real text units and 400 real figures from one PubMed Central bundle (median text
+~250 tokens, 90th percentile ~800, truncated at 1,024 tokens like the reference runs). Each runtime runs once warm,
+on one GPU with 3-4 CPUs, in 2026-11 Slurm jobs. The card runtimes are sentence-transformers 6.3.0 (EmbeddingGemma 2)
+and transformers 5.22.2 `NeoMMEForRetrieval` (NeoMME) on torch 2.15 / CUDA 13.2 (`py/gpu_ref_bench.py`). Their best
+batch size (64 or 256 texts, 16 or 64 images) is shown. "x" is flashembed-gpu / reference items per second.
+Memory is what each runtime's allocator holds: torch's peak reserved memory, and flashembed-gpu's weights +
+activation arena + cuBLAS workspace. The CUDA context comes on top for both.
+
+RESULTS_TABLES
+
+### Parity
+
+Per-item cosine to the reference's **FP32** vectors on the same GPU, minimum over all items (`py/gpu_compare.py`):
+
+PARITY_TABLE
+
+- FP32 is FP32-exact in practice: 1 - cos <= 2e-8 everywhere. The FP32 GEMMs use cuBLAS's BF16x9 emulation (B200)
+  or SGEMM (RTX PRO 6000); attention uses 3xTF32 tensor-core MMAs. Against the CPU runner's vectors (computed at the
+  same 1,024-token truncation) the GPU FP32 vectors agree to cos >= 0.99999996.
+- BF16 stays above 0.999 for every text item. One of the 400 figures falls to 0.9986, on both GPUs. The reference's
+  own bf16 run is no better on these inputs: its min cosine to its FP32 run is 0.9989 for figures (one below 0.999)
+  and 0.9994-0.9997 for text. In this mode flashembed-gpu is as close to FP32 as the reference's bf16 is.
+- GPU image preprocessing gives the same pixels as CPU preprocessing: the vectors are bit-identical in both
+  precisions (`--img-mb 0` vs default, same batches).
+
 
 ## Build and run
 

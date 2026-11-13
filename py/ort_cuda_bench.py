@@ -27,6 +27,9 @@ def main():
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--n", type=int, default=0)
     ap.add_argument("--provider", default="cuda")
+    ap.add_argument("--trt-precision", default="fp32", choices=["fp32", "fp16", "bf16"],
+                    help="TensorRT EP builder precision (fp32 = TF32 off where the EP allows it)")
+    ap.add_argument("--trt-cache", type=Path, default=None)
     a = ap.parse_args()
     import onnxruntime as ort
     import pynvml
@@ -62,8 +65,19 @@ def main():
         texts = [f"<doc>{r['text']}" for r in rows]
         special = False
         graph = a.onnx / "neomme_text.onnx"
+    B, L = a.batch, a.max_len
+    if a.model == "gemma":
+        names = {"input_ids": "", "attention_mask": "", "mm_embeds": "x512", "mm_mask": ""}
+    else:
+        names = {"input_ids": "", "attention_mask": ""}
+    shp = lambda b, l: ",".join(f"{n}:{b}x{l}{e}" for n, e in names.items())
+    trt = {"trt_fp16_enable": a.trt_precision == "fp16", "trt_bf16_enable": a.trt_precision == "bf16",
+           "trt_engine_cache_enable": True, "trt_engine_cache_path": str(a.trt_cache or a.out / "trt-cache"),
+           "trt_timing_cache_enable": True, "trt_builder_optimization_level": 3,
+           "trt_profile_min_shapes": shp(1, 2), "trt_profile_opt_shapes": shp(B, 512), "trt_profile_max_shapes": shp(B, L),
+           "trt_max_workspace_size": 8 << 30}
     prov = {"cuda": [("CUDAExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"})],
-            "tensorrt": [("TensorrtExecutionProvider", {"trt_fp16_enable": False}), "CUDAExecutionProvider"]}[a.provider]
+            "tensorrt": [("TensorrtExecutionProvider", trt), ("CUDAExecutionProvider", {})]}[a.provider]
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     t_load = time.perf_counter()
@@ -95,17 +109,19 @@ def main():
                 out[i] = d[j]
         return out
 
-    run(order[: a.batch])  # warm-up
+    t_w = time.perf_counter()
+    run(order[: a.batch])  # warm-up (TensorRT: engine build for the profile)
+    warm_s = time.perf_counter() - t_w
     t0 = time.perf_counter()
     out = run(order)
     wall = time.perf_counter() - t0
     stop[0] = True
     a.out.mkdir(parents=True, exist_ok=True)
-    tag = f"{a.model}-text-ort-{a.provider}"
+    tag = f"{a.model}-text-ort-{a.provider}" + (f"-{a.trt_precision}" if a.provider == "tensorrt" else "")
     np.save(a.out / f"{tag}.dense.npy", np.stack([out[i] for i in range(len(texts))]).astype(np.float32))
     json.dump([r["id"] for r in rows], open(a.out / f"{tag}.ids.json", "w"))
     res = {"runtime": f"onnxruntime-{a.provider}", "ort": ort.__version__, "model": a.model, "batch": a.batch,
-           "n": len(texts), "wall_s": wall, "items_per_s": len(texts) / wall, "load_s": load_s,
+           "n": len(texts), "wall_s": wall, "warmup_s": warm_s, "precision": a.trt_precision if a.provider == "tensorrt" else "fp32", "items_per_s": len(texts) / wall, "load_s": load_s,
            "peak_device_used_mb": peak[0] / 2**20, "device_used_before_mb": used0 / 2**20, "max_len": a.max_len}
     print(json.dumps(res))
     with open(a.out / "results.jsonl", "a") as f:
