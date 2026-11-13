@@ -46,8 +46,13 @@ the same inputs, nodes and CPUs, over 353 cases measured on both runtimes, on th
 
 `flashembed-gpu` (cargo feature `cuda`) is a native CUDA engine for the same two models, text and images. Its fused
 kernels include FlashAttention-style tensor-core attention for bf16 and 3xTF32 for fp32, and GEMMs run on cuBLAS.
-Inputs are packed sequences with no padding. It produces the same vectors as the model-card runtimes on GPU:
-cos >= 0.99999998 in fp32. Compared with them:
+Inputs are packed sequences with no padding.
+
+The reference is the runtime each model card documents, run on the same GPU: sentence-transformers 6.3.0 for
+EmbeddingGemma 2 and transformers 5.22.2 `NeoMMEForRetrieval` for NeoMME, on PyTorch 2.15 / CUDA 13.2. Its default
+SDPA attention was used in the same precision (bf16 or fp32), at its fastest batch size. Both sides embedded the same 4,000 text
+chunks and 400 figures from PubMed Central. flashembed-gpu produces the same vectors as this reference
+(cos >= 0.99999998 in fp32). Compared with it:
 
 - **NVIDIA B200**: 8-9x faster for bf16 text and 5x for images, at 1/5-1/30 of the memory.
 - **RTX PRO 6000 Blackwell**: 6-7x faster for bf16 text and 5x for images.
