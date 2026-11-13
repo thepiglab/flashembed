@@ -53,6 +53,17 @@ cos >= 0.99999998 in fp32. Compared with them:
 - **RTX PRO 6000 Blackwell**: 6-7x faster for bf16 text and 5x for images.
 - **fp32**: 2-5x faster on both GPUs.
 
+| GPU | precision | EmbeddingGemma 2 text | NeoMME text | EmbeddingGemma 2 images | NeoMME images |
+|---|---|---|---|---|---|
+| NVIDIA B200 | bf16 | 8.1x (1.6 vs 49.8 GB) | 9.1x (1.9 vs 17.4 GB) | 5.5x (3.6 vs 8.6 GB) | 4.9x (2.2 vs 10.0 GB) |
+| NVIDIA B200 | fp32 | 3.1x | 4.9x | 2.5x | 4.5x |
+| RTX PRO 6000 Blackwell | bf16 | 6.7x (0.86 vs 12.9 GB) | 5.9x (0.93 vs 4.8 GB) | 4.6x (3.6 vs 8.6 GB) | 5.4x (2.2 vs 2.7 GB) |
+| RTX PRO 6000 Blackwell | fp32 | 2.5x | 2.7x | 1.7x | 2.2x |
+
+(flashembed-gpu items/s over the reference's best batch size, on 4,000 real text chunks and 400 real figures;
+memory is flashembed-gpu vs reference. bf16 stays at cos >= 0.9999 for text and >= 0.9986 for figures against the
+reference's fp32 vectors, as close as the reference's own bf16 mode.)
+
 It also beats ONNX Runtime's CUDA and TensorRT execution providers on the same graphs. Details, design and
 measurements are in [docs/GPU.md](docs/GPU.md).
 
