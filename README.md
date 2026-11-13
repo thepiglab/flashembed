@@ -2,8 +2,8 @@
 
 Fast FP32 CPU inference for two multimodal embedding models, with the same vectors as their reference Python runtimes:
 
-- **EmbeddingGemma 2** (`google/embeddinggemma-2`): text, images, audio and video, up to 8,192 tokens.
-- **NeoMME-260M-Retriever** (`Hcompany/NeoMME-260M-Retriever`): text and images (documents and queries); 1024-d dense
+- **EmbeddingGemma 2** ([google/embeddinggemma-2](https://huggingface.co/google/embeddinggemma-2)): text, images, audio and video, up to 8,192 tokens.
+- **NeoMME-260M-Retriever** ([Hcompany/NeoMME-260M-Retriever](https://huggingface.co/Hcompany/NeoMME-260M-Retriever-ST-dense): text and images (documents and queries); 1024-d dense
   and 128-d late-interaction (multi-vector) embeddings, up to 16,384 tokens.
 
 flashembed is a Rust runner around ONNX Runtime. The models are exported to ONNX once. Attention and two other hot
