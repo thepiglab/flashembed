@@ -7,3 +7,4 @@ pub mod flash;
 pub mod gpu;
 pub mod quant;
 pub mod fidelity;
+pub mod qreport;

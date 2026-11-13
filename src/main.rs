@@ -38,6 +38,8 @@ enum Cmd {
     Calib(CalibArgs),
     /// Vector fidelity of a variant's `bench --save` outputs against fp32 (cosine, neighbours, caption->figure).
     Fidelity(flashembed::fidelity::FidelityArgs),
+    /// Markdown tables (docs/QUANTIZATION.md) from slurm/qbench.sbatch output dirs.
+    Qreport(flashembed::qreport::QreportArgs),
 }
 
 #[derive(clap::Args)]
@@ -987,14 +989,17 @@ fn bench(a: BenchArgs) -> Result<Option<Calib>> {
 }
 
 fn main() -> Result<()> {
-    if std::env::var("ORT_DYLIB_PATH").is_err() {
+    let cli = Cli::parse();
+    let needs_ort = matches!(cli.cmd, Cmd::Embed(_) | Cmd::Bench(_) | Cmd::Calib(_));
+    if needs_ort && std::env::var("ORT_DYLIB_PATH").is_err() {
         bail!("set ORT_DYLIB_PATH to libonnxruntime.so (the Python onnxruntime wheel's copy)");
     }
-    match Cli::parse().cmd {
+    match cli.cmd {
         Cmd::Embed(a) => bench(a.into_bench()?).map(|_| ()),
         Cmd::Bench(a) => bench(a).map(|_| ()),
         Cmd::Quantize(a) => quant::quantize_cmd(a),
         Cmd::Fidelity(a) => flashembed::fidelity::run(a),
+        Cmd::Qreport(a) => flashembed::qreport::run(a),
         Cmd::Calib(mut a) => {
             a.bench.calib = true;
             let out = a.calib_out.clone();
