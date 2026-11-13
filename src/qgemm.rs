@@ -137,15 +137,60 @@ pub fn quantize_rows(x: &[f32], m: usize, k: usize, block: usize, kpad: usize, i
         let row = &x[r * k..(r + 1) * k];
         for blk in 0..nb {
             let (k0, k1) = (blk * block, ((blk + 1) * block).min(k));
+            #[cfg(target_arch = "x86_64")]
+            let amax = if i != Isa::Scalar && k1 - k0 == block && block % 32 == 0 {
+                unsafe { absmax_avx2(row.as_ptr().add(k0), block) }
+            } else {
+                row[k0.min(k)..k1.max(k0.min(k))].iter().fold(0f32, |a, v| a.max(v.abs()))
+            };
+            #[cfg(not(target_arch = "x86_64"))]
             let amax = row[k0.min(k)..k1.max(k0.min(k))].iter().fold(0f32, |a, v| a.max(v.abs()));
             let s = if amax > 0.0 { amax / qmax } else { 1.0 };
             sd[blk] = if amax > 0.0 { s } else { 0.0 };
             let inv = 1.0 / s;
+            #[cfg(target_arch = "x86_64")]
+            if i != Isa::Scalar && k1 - k0 == block && block % 32 == 0 {
+                unsafe { quant_block_avx2(row.as_ptr().add(k0), block, inv, qmax, off, dst.as_mut_ptr().add(k0)) };
+                continue;
+            }
             for kk in blk * block..(blk + 1) * block {
                 let q = if kk < k { (row[kk] * inv).round().clamp(-qmax, qmax) as i32 } else { 0 };
                 dst[kk] = (q + off) as u8;
             }
         }
+    }
+}
+
+/// q = clamp(round_even(x * inv), -qmax, qmax) + off as u8, 32 values per step (all three CPUs have AVX2).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn quant_block_avx2(x: *const f32, n: usize, inv: f32, qmax: f32, off: i32, dst: *mut u8) {
+    unsafe {
+        let (vi, lo, hi, vo) = (_mm256_set1_ps(inv), _mm256_set1_ps(-qmax), _mm256_set1_ps(qmax), _mm256_set1_epi32(off));
+        let q = |p: *const f32| _mm256_add_epi32(_mm256_cvtps_epi32(_mm256_min_ps(_mm256_max_ps(_mm256_mul_ps(_mm256_loadu_ps(p), vi), lo), hi)), vo);
+        for j in (0..n).step_by(32) {
+            let (a, b, c, d) = (q(x.add(j)), q(x.add(j + 8)), q(x.add(j + 16)), q(x.add(j + 24)));
+            let ab = _mm256_packs_epi32(a, b);
+            let cd = _mm256_packs_epi32(c, d);
+            // packs/packus interleave 4-byte groups per 128-bit lane: a0 b0 c0 d0 a1 b1 c1 d1 -> a0 a1 b0 b1 ...
+            let u = _mm256_permutevar8x32_epi32(_mm256_packus_epi16(ab, cd), _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+            _mm256_storeu_si256(dst.add(j) as *mut _, u);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn absmax_avx2(x: *const f32, n: usize) -> f32 {
+    unsafe {
+        let mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+        let mut m = _mm256_setzero_ps();
+        for j in (0..n).step_by(8) {
+            m = _mm256_max_ps(m, _mm256_and_ps(_mm256_loadu_ps(x.add(j)), mask));
+        }
+        let mut t = [0f32; 8];
+        _mm256_storeu_ps(t.as_mut_ptr(), m);
+        t.iter().fold(0f32, |a, &b| a.max(b))
     }
 }
 
@@ -289,8 +334,13 @@ unsafe impl<T> Sync for PM<T> {}
 pub fn gemm(x: &[f32], m: usize, w: &W<'_>, y: &mut [f32], i: Isa, par: &dyn Fn(usize, &(dyn Fn(usize) + Sync + Send))) {
     let mp = m.next_multiple_of(MR);
     let nb = w.kpad / w.block;
-    let mut aq = vec![0u8; mp * w.kpad];
-    let mut sa = vec![0f32; mp * nb];
+    let mut aq: Vec<u8> = Vec::with_capacity(mp * w.kpad);
+    let mut sa: Vec<f32> = Vec::with_capacity(mp * nb);
+    // SAFETY: quantize_rows writes every element of both buffers (padding rows included) before the GEMM reads them
+    unsafe {
+        aq.set_len(mp * w.kpad);
+        sa.set_len(mp * nb);
+    }
     // 1. quantize activations (parallel over row chunks)
     {
         let chunks = mp.div_ceil(ROWS_PER_TASK);

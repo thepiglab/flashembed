@@ -271,6 +271,8 @@ pub struct Opts {
     /// qdq8: tensor name -> activation range (from `flashembed calib`), and whether to use the batch-averaged range
     pub calib: Option<HashMap<String, Range>>,
     pub calib_avg: bool,
+    /// q8blk: fuse MatMuls that read the same activation (q/k/v, gate/up) into one QMatMul + Split
+    pub fuse: bool,
 }
 
 /// Rewrite one graph; returns (quantized MatMuls, module paths kept fp32).
@@ -284,7 +286,53 @@ pub fn rewrite(l: &mut Loaded, o: &Opts) -> Result<(usize, Vec<String>)> {
     let mut extra_out = vec![];
     let mut done = 0;
     let old: Vec<NodeProto> = std::mem::take(&mut g.node);
-    for n in old {
+    // q8blk --fuse: chosen MatMuls sharing an activation input -> one QMatMul over concatenated weights + Split
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    if o.fuse && o.scheme == "q8blk" {
+        for (i, n) in old.iter().enumerate() {
+            if sel.chosen.contains(n.name()) {
+                groups.entry(n.input[0].clone()).or_default().push(i);
+            }
+        }
+        groups.retain(|_, v| v.len() > 1);
+    }
+    let first_of: HashMap<usize, String> = groups.iter().map(|(a, v)| (v[0], a.clone())).collect();
+    let in_group: BTreeSet<usize> = groups.values().flat_map(|v| v[1..].iter().copied()).collect();
+    for (idx, n) in old.iter().enumerate() {
+        if in_group.contains(&idx) {
+            continue; // emitted with its group's first member
+        }
+        if let Some(a) = first_of.get(&idx) {
+            let mem: Vec<&NodeProto> = groups[a].iter().map(|&i| &old[i]).collect();
+            let k = dims[&mem[0].input[1]][0] as usize;
+            let ns: Vec<usize> = mem.iter().map(|m| dims[&m.input[1]][1] as usize).collect();
+            let ntot: usize = ns.iter().sum();
+            let mut w = vec![0f32; k * ntot];
+            let mut c0 = 0;
+            for (m, &nn) in mem.iter().zip(&ns) {
+                let wm = f32s(&l.data[&m.input[1]]);
+                for kk in 0..k {
+                    w[kk * ntot + c0..kk * ntot + c0 + nn].copy_from_slice(&wm[kk * nn..(kk + 1) * nn]);
+                }
+                c0 += nn;
+            }
+            let nm = format!("{}_fused", mem[0].name());
+            let pk = crate::qgemm::pack(&w, k, ntot, o.block);
+            let nb = pk.kpad / pk.block;
+            let (bn, sn, cn, spn, yt) = (format!("{nm}_qB"), format!("{nm}_qS"), format!("{nm}_qC"), format!("{nm}_split"), format!("{nm}_y"));
+            inits.push((tensor(&bn, I8, &[(pk.npad / crate::qgemm::NR) as i64, (pk.kpad / 4) as i64, crate::qgemm::NR as i64, 4]),
+                        pk.b.iter().map(|&x| x as u8).collect()));
+            inits.push((tensor(&sn, F32, &[nb as i64, pk.npad as i64]), pk.sb.iter().flat_map(|x| x.to_le_bytes()).collect()));
+            inits.push((tensor(&cn, I32, &[nb as i64, pk.npad as i64]), pk.cs.iter().flat_map(|x| x.to_le_bytes()).collect()));
+            inits.push((tensor(&spn, 7, &[ns.len() as i64]), ns.iter().flat_map(|&x| (x as i64).to_le_bytes()).collect()));
+            let attrs = vec![attr_i("K", k as i64), attr_i("N", ntot as i64), attr_i("block", o.block as i64)];
+            nodes.push(node("QMatMul", "flashembed", &format!("{nm}_q8"), &[a, &bn, &sn, &cn], &[&yt], attrs));
+            let outs: Vec<&str> = mem.iter().map(|m| m.output[0].as_str()).collect();
+            nodes.push(node("Split", "", &format!("{nm}_split_node"), &[&yt, &spn], &outs, vec![attr_i("axis", -1)]));
+            done += mem.len();
+            continue;
+        }
+        let n = n.clone();
         if !sel.chosen.contains(n.name()) {
             nodes.push(n);
             continue;
@@ -419,6 +467,9 @@ pub struct QuantizeArgs {
     /// qdq8: use the batch-averaged min/max instead of the global min/max
     #[arg(long)]
     pub calib_avg: bool,
+    /// q8blk: one QMatMul (+ Split) for MatMuls that share an input (q/k/v, gate/up): one activation quantization
+    #[arg(long)]
+    pub fuse: bool,
 }
 
 pub fn quantize_cmd(a: QuantizeArgs) -> Result<()> {
@@ -426,7 +477,7 @@ pub fn quantize_cmd(a: QuantizeArgs) -> Result<()> {
     let calib: Option<HashMap<String, HashMap<String, Range>>> =
         a.calib.as_ref().map(|p| -> Result<_> { Ok(serde_json::from_str(&std::fs::read_to_string(p)?)?) }).transpose()?;
     let mut summary = serde_json::json!({"scheme": a.scheme, "block": a.block, "keep": a.keep, "keep_edge": a.keep_edge,
-                                         "src": a.src, "calib_avg": a.calib_avg, "graphs": {}});
+                                         "src": a.src, "calib_avg": a.calib_avg, "fuse": a.fuse, "graphs": {}});
     for g in GRAPHS {
         let src = a.src.join(format!("{g}.onnx"));
         if !src.exists() {
@@ -445,7 +496,7 @@ pub fn quantize_cmd(a: QuantizeArgs) -> Result<()> {
         let mut l = load(&src)?;
         let o = Opts {
             scheme: a.scheme.clone(), block: a.block, keep: a.keep.as_deref().map(regex::Regex::new).transpose()?,
-            keep_edge: a.keep_edge, calib: calib.as_ref().and_then(|c| c.get(g).cloned()), calib_avg: a.calib_avg,
+            keep_edge: a.keep_edge, calib: calib.as_ref().and_then(|c| c.get(g).cloned()), calib_avg: a.calib_avg, fuse: a.fuse,
         };
         if a.scheme == "qdq8" && o.calib.is_none() {
             bail!("qdq8: no calibration for {g} in --calib");

@@ -40,7 +40,7 @@ fn model(m: usize, k: usize, n: usize, w: &[f32], scheme: &str, xrange: (f32, f3
     let mut l = quant::Loaded { model: mdl, data: [("W".to_string(), w.iter().flat_map(|x| x.to_le_bytes()).collect())].into() };
     if scheme != "fp32" {
         let calib = (scheme == "qdq8").then(|| [("X".to_string(), quant::Range { lo: xrange.0, hi: xrange.1, lo_avg: xrange.0, hi_avg: xrange.1, batches: 1 })].into());
-        quant::rewrite(&mut l, &quant::Opts { scheme: scheme.into(), block: if scheme == "q8blk" { 64 } else { 32 }, keep: None, keep_edge: 0, calib, calib_avg: false })?;
+        quant::rewrite(&mut l, &quant::Opts { scheme: scheme.into(), block: if scheme == "q8blk" { 64 } else { 32 }, keep: None, keep_edge: 0, calib, calib_avg: false, fuse: false })?;
     }
     // inline all initializers
     let g = l.model.graph.as_mut().unwrap();
