@@ -129,6 +129,10 @@ Text is embedded as given: add the model card's prompt prefix yourself (Embeddin
 | mrl | `mrl.sbatch` (`BIN=... ONNX=...`) | EmbeddingGemma 2 Matryoshka sizes vs sentence-transformers' `truncate_dim`, all modalities |
 | bench / ctx / mm / ops | `bench.sbatch`, `ctx.sbatch`, `mm.sbatch`, `ops.sbatch` | the benchmark families in PROFILING.md |
 
+To keep jobs off the wrong allocation, set `FLASHEMBED_ALLOWED_ACCOUNTS` / `FLASHEMBED_FORBIDDEN_ACCOUNTS` (regexes)
+in the site env, which sources `slurm/guard.sh`. A job whose account or QOS fails them cancels itself before doing
+anything, and `flashembed_sbatch` (a drop-in for `sbatch`) refuses to submit it.
+
 `py/final_report.py` collects a results tree into the tables of PROFILING.md (`py/fill_doc.py`).
 
 ## Layout
