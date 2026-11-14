@@ -139,6 +139,12 @@ sentence-transformers' `truncate_dim` does; queries and documents must use the s
 late files).
 Text is embedded as given: add the model card's prompt prefix yourself (EmbeddingGemma 2:
 `title: {title} | text: {content}` for documents, `task: search result | query: {q}` for queries).
+`flashembed serve` keeps the graphs loaded for many requests (no per-file startup or thread-pool tuning).
+It takes the same model options plus `--modalities text,image,video,audio`, prints one `{"ready": true, ...}` line,
+then reads one JSON request per stdin line, `{"id": ..., "modality": "text", "input": "items.jsonl", "out": "dir"}`,
+writes the same files as `embed` and answers with one stdout line: `{"id": ..., "ok": true, "items": N, "failed":
+[...], "seconds": s}` or `{"id": ..., "ok": false, "error": "..."}`. Items that fail (unreadable file, bad row) are
+listed in `failed` and left out of the outputs; the server exits at end of input.
 `flashembed bench` runs the benchmark harness; `flash-check` tests the attention kernel against an f64 reference.
 
 ### Running the benchmarks on a Slurm cluster
