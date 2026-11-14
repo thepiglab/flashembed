@@ -26,6 +26,8 @@ def main():
     ap.add_argument("--dtype", default="float32")
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--n", type=int, default=0)
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--ids", default="", help="comma-separated ids to keep")
     a = ap.parse_args()
     import torch
     from sentence_transformers import SentenceTransformer
@@ -34,6 +36,9 @@ def main():
     torch.backends.cudnn.allow_tf32 = False
     rows = [json.loads(l) for l in open(a.input)]
     rows = [r for r in rows if r.get("kind", a.modality) == a.modality]
+    if a.ids:
+        keep = set(a.ids.split(","))
+        rows = [r for r in rows if r["id"] in keep]
     if a.n:
         rows = rows[: a.n]
     root = a.input.parent
@@ -41,26 +46,29 @@ def main():
     snap = json.load(open(a.models_json))["google/embeddinggemma-2"]["path"]
     cfg = {"video": {"audio_config": None}, "audio": {"vision_config": None}}[a.modality]
     t = time.perf_counter()
-    m = SentenceTransformer(snap, device="cuda", config_kwargs=cfg, model_kwargs={"torch_dtype": getattr(torch, a.dtype)})
+    m = SentenceTransformer(snap, device=a.device, config_kwargs=cfg, model_kwargs={"torch_dtype": getattr(torch, a.dtype)})
     m.max_seq_length = 8192
     m.eval()
     load_s = time.perf_counter() - t
     m.encode(items[: a.batch], batch_size=a.batch, normalize_embeddings=True, show_progress_bar=False)  # warm-up
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
+    cuda = a.device.startswith("cuda")
+    if cuda:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
     t = time.perf_counter()
     v = m.encode(items, batch_size=a.batch, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
-    torch.cuda.synchronize()
+    if cuda:
+        torch.cuda.synchronize()
     wall = time.perf_counter() - t
     a.out.mkdir(parents=True, exist_ok=True)
-    tag = f"gemma-{a.modality}-{a.dtype}"
+    tag = f"gemma-{a.modality}-{a.dtype}" + ("" if cuda else f"-{a.device}-b{a.batch}")
     np.save(a.out / f"{tag}.dense.npy", np.asarray(v, np.float32))
     json.dump([r["id"] for r in rows], open(a.out / f"{tag}.ids.json", "w"))
     res = {"runtime": "sentence-transformers", "modality": a.modality, "dtype": a.dtype, "batch": a.batch, "n": len(rows),
            "wall_s": wall, "items_per_s": len(rows) / wall, "load_s": load_s,
-           "gpu_peak_mb": torch.cuda.max_memory_allocated() / 2**20,
-           "gpu_peak_reserved_mb": torch.cuda.max_memory_reserved() / 2**20,
-           "gpu": torch.cuda.get_device_name(), "job": os.environ.get("SLURM_JOB_ID")}
+           "gpu_peak_mb": torch.cuda.max_memory_allocated() / 2**20 if cuda else None,
+           "gpu_peak_reserved_mb": torch.cuda.max_memory_reserved() / 2**20 if cuda else None,
+           "gpu": torch.cuda.get_device_name() if cuda else a.device, "job": os.environ.get("SLURM_JOB_ID")}
     print(json.dumps(res))
     with open(a.out / "results.jsonl", "a") as f:
         f.write(json.dumps(res) + "\n")
