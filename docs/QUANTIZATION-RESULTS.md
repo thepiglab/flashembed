@@ -471,14 +471,61 @@ ORT dynamic / static / weight-only int8 and int4 vs fp32 flashembed and the mode
 | gemma | Zen 3 (EPYC 75F3) | q8blk | 199 | 0.764 / 0.819 | 0.835 / 0.866 | +0.032 [+0.010, +0.055] | 0.819 |
 | gemma | Zen 3 (EPYC 75F3) | q8blk-b32 | 199 | 0.764 / 0.819 | 0.835 / 0.867 | +0.032 [+0.012, +0.054] | 0.839 |
 
+**neomme image, Zen 2 (EPYC 7702)** (16 threads, batch 4)
+
+| runtime | items/s | vs fp32 flashembed | vs Python | peak RSS MB | dense cos vs fp32: min / p1 / median | top-10 overlap | fp32 top-1 in top 10 | dense cos vs Python: min |
+|---|---|---|---|---|---|---|---|---|
+| Python (model card, fp32) | 0.63 | 0.33x | 1.00x | 4196 | - | - | - | - |
+| flashembed fp32 | 2.51 | 1.00x | 3.19x | 3439 | - | - | - | 1.00000 |
+| flashembed dyn8rr | 3.01 | 1.17x | 3.74x | 2950 | 0.86223 / 0.87001 / 0.926873 | 0.552 | 0.840 | 0.86223 |
+| flashembed q8blk | 2.95 | 1.16x | 3.72x | 2998 | 0.98808 / 0.99400 / 0.998882 | 0.915 | 1.000 | 0.98808 |
+| flashembed q8blk-b32 | 2.98 | 1.18x | 3.76x | 3001 | 0.99136 / 0.99662 / 0.999272 | 0.927 | 1.000 | 0.99136 |
+
 **neomme text, Zen 2 (EPYC 7702)** (16 threads, batch 4)
 
 | runtime | items/s | vs fp32 flashembed | vs Python | peak RSS MB | dense cos vs fp32: min / p1 / median | top-10 overlap | fp32 top-1 in top 10 | dense cos vs Python: min |
 |---|---|---|---|---|---|---|---|---|
 | Python (model card, fp32) | 1.13 | 0.41x | 1.00x | 25280 | - | - | - | - |
-| flashembed fp32 | 2.76 | 1.00x | 2.44x | 9924 | - | - | - | - |
-| flashembed q8blk | 3.18 | 1.15x | 2.81x | 9628 | - | - | - | - |
-| flashembed q8blk-b32 | 2.93 | 1.06x | 2.59x | 9684 | - | - | - | - |
+| flashembed fp32 | 2.76 | 1.00x | 2.45x | 9924 | - | - | - | 1.00000 |
+| flashembed dyn8rr | 3.07 | 1.11x | 2.72x | 9608 | 0.92747 / 0.93966 / 0.976348 | 0.864 | 0.999 | 0.92747 |
+| flashembed q8blk | 3.18 | 1.14x | 2.78x | 9628 | 0.99591 / 0.99884 / 0.999679 | 0.951 | 1.000 | 0.99591 |
+| flashembed q8blk-b32 | 2.93 | 1.05x | 2.57x | 9684 | 0.99820 / 0.99926 / 0.999771 | 0.958 | 1.000 | 0.99820 |
+
+**Caption -> figure retrieval on the held-out set** (each caption queries all figures of the set)
+
+| model | CPU | variant | queries | R@1 fp32 / variant | MRR fp32 / variant | MRR variant - fp32 [95 % CI] | same rank as fp32 |
+|---|---|---|---|---|---|---|---|
+| neomme | Zen 2 (EPYC 7702) | dyn8rr | 199 | 0.307 / 0.256 | 0.411 / 0.347 | -0.064 [-0.105, -0.022] | 0.246 |
+| neomme | Zen 2 (EPYC 7702) | q8blk | 199 | 0.307 / 0.296 | 0.411 / 0.400 | -0.011 [-0.022, -0.002] | 0.558 |
+| neomme | Zen 2 (EPYC 7702) | q8blk-b32 | 199 | 0.307 / 0.307 | 0.411 / 0.410 | -0.000 [-0.012, +0.011] | 0.497 |
+
+**gemma image, Zen 2 (EPYC 7702)** (16 threads, batch 4)
+
+| runtime | items/s | vs fp32 flashembed | vs Python | peak RSS MB | dense cos vs fp32: min / p1 / median | top-10 overlap | fp32 top-1 in top 10 | dense cos vs Python: min |
+|---|---|---|---|---|---|---|---|---|
+| Python (model card, fp32) | 0.28 | 0.56x | 1.00x | 3945 | - | - | - | - |
+| flashembed fp32 | 0.55 | 1.00x | 1.79x | 2628 | - | - | - | 1.00000 |
+| flashembed dyn8rr | 0.53 | 1.03x | 1.84x | 1784 | 0.78121 / 0.83577 / 0.933092 | 0.475 | 0.790 | 0.78121 |
+| flashembed q8blk | 0.57 | 1.12x | 1.99x | 1975 | 0.97165 / 0.97989 / 0.997877 | 0.838 | 0.990 | 0.97165 |
+| flashembed q8blk-b32 | 0.57 | 1.10x | 1.96x | 1923 | 0.97603 / 0.98641 / 0.998420 | 0.860 | 1.000 | 0.97603 |
+
+**gemma text, Zen 2 (EPYC 7702)** (16 threads, batch 4)
+
+| runtime | items/s | vs fp32 flashembed | vs Python | peak RSS MB | dense cos vs fp32: min / p1 / median | top-10 overlap | fp32 top-1 in top 10 | dense cos vs Python: min |
+|---|---|---|---|---|---|---|---|---|
+| Python (model card, fp32) | 0.89 | 0.33x | 1.00x | 7225 | - | - | - | - |
+| flashembed fp32 | 2.77 | 1.00x | 3.01x | 5615 | - | - | - | 1.00000 |
+| flashembed dyn8rr | 2.95 | 1.00x | 3.02x | 5282 | 0.93475 / 0.94642 / 0.974812 | 0.596 | 0.942 | 0.93475 |
+| flashembed q8blk | 3.07 | 1.10x | 3.33x | 5362 | 0.99670 / 0.99821 / 0.999322 | 0.945 | 1.000 | 0.99670 |
+| flashembed q8blk-b32 | 3.04 | 1.06x | 3.19x | 5394 | 0.99645 / 0.99891 / 0.999576 | 0.958 | 1.000 | 0.99645 |
+
+**Caption -> figure retrieval on the held-out set** (each caption queries all figures of the set)
+
+| model | CPU | variant | queries | R@1 fp32 / variant | MRR fp32 / variant | MRR variant - fp32 [95 % CI] | same rank as fp32 |
+|---|---|---|---|---|---|---|---|
+| gemma | Zen 2 (EPYC 7702) | dyn8rr | 199 | 0.764 / 0.794 | 0.835 / 0.851 | +0.016 [-0.026, +0.058] | 0.704 |
+| gemma | Zen 2 (EPYC 7702) | q8blk | 199 | 0.764 / 0.819 | 0.835 / 0.866 | +0.032 [+0.010, +0.055] | 0.819 |
+| gemma | Zen 2 (EPYC 7702) | q8blk-b32 | 199 | 0.764 / 0.819 | 0.835 / 0.867 | +0.032 [+0.012, +0.054] | 0.839 |
 
 ## Rust QMatMul, first version (scalar activation quantizer)
 

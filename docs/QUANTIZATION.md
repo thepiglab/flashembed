@@ -17,8 +17,8 @@ same node and inputs. Full per-run tables: [QUANTIZATION-RESULTS.md](QUANTIZATIO
 | Zen 5 (VNNI) | EmbeddingGemma 2 | 3.7x / 2.1x | **1.21x / 1.28x** | 0.9981 / 0.9977 | +0.001 [-0.009, +0.012] |
 | Zen 3 | NeoMME | 1.6x / 1.3x | **1.37x / 1.45x** | 0.9982 / 0.9914 | -0.000 [-0.012, +0.011] |
 | Zen 3 | EmbeddingGemma 2 | 2.4x / 1.4x | **1.23x / 1.21x** | 0.9965 / 0.9760 | +0.032 [+0.012, +0.054] |
-| Zen 2 | NeoMME | 1.9x / 1.7x | pending | pending | pending |
-| Zen 2 | EmbeddingGemma 2 | 2.7x / 1.8x | pending | pending | pending |
+| Zen 2 | NeoMME | 1.9x / 1.7x | **1.05x / 1.18x** | 0.9982 / 0.9914 | -0.000 [-0.012, +0.011] |
+| Zen 2 | EmbeddingGemma 2 | 2.7x / 1.8x | **1.06x / 1.10x** | 0.9965 / 0.9760 | +0.032 [+0.012, +0.054] |
 
 `q8blk-b32` is `flashembed quantize --scheme q8blk --block 32`, run by the Rust op `flashembed::QMatMul`. Speed is
 items/s relative to fp32 flashembed on the same node (999 real text chunks from PigMed's 512-word chunking, 200 PMC
@@ -38,6 +38,8 @@ the 200 held-out figures (199 queries; fp32 MRR 0.411 NeoMME, 0.835 EmbeddingGem
   no x86 bf16 GEMM.
 - **EmbeddingGemma 2 gains less** (1.2-1.35x) than NeoMME (1.4-1.6x). Its text layers are narrow (hidden 512), and
   more of its time is attention, norms and the per-layer embedding inputs, which stay fp32.
+- **Zen 2 gains little** (1.05-1.18x): its AVX2 integer units have no throughput edge over fp32 FMA. int8 pays off
+  on Zen 5 (1.2-1.6x) and Zen 3 (1.2-1.45x).
 - **Zen 2/3 vs Zen 5 vectors differ** (7-bit vs 8-bit activations). Gemma images on Zen 3 drift most: worst cosine
   0.976, and held-out caption -> figure MRR moved +0.032 (outside the CI, though in the good direction). Mixed-node
   runs should either accept this or force one path (`FLASHEMBED_QGEMM_ISA=avx2` everywhere).
@@ -140,14 +142,15 @@ Zen 2 (nodes at load 85-160 of 128 cores, so speeds are noisier):
 
 | model | modality | Python | fp32 | `dyn8` | `dyn8rr` | `nb8-a4` | `q8blk` | `q8blk-b32` |
 |---|---|---|---|---|---|---|---|---|
-| NeoMME | text: speed | 0.53x | 1 (3.0/s) | 1.12x | 1.13x | 0.50x | pending | pending |
-| | images: speed | 0.60x | 1 (2.7/s) | 1.13x | 1.13x | 0.55x | pending | pending |
-| | caption -> figure MRR change | | | -0.212 | -0.064 | +0.002 | pending | pending |
-| EmbeddingGemma 2 | text: speed | 0.39x | 1 (3.1/s) | 1.07x | 1.08x | 0.56x | pending | pending |
-| | images: speed | 0.57x | 1 (0.6/s) | 1.04x | 1.05x | 0.57x | pending | pending |
-| | caption -> figure MRR change | | | -0.718 | +0.016 | -0.001 | pending | pending |
+| NeoMME | text: speed | 0.53x | 1 (3.0/s) | 1.12x | 1.11-1.13x | 0.50x | 1.14x | 1.05x |
+| | images: speed | 0.60x | 1 (2.7/s) | 1.13x | 1.13-1.17x | 0.55x | 1.16x | 1.18x |
+| | caption -> figure MRR change | | | -0.212 | -0.064 | +0.002 | -0.011 [-0.022, -0.002] | -0.000 [-0.012, +0.011] |
+| EmbeddingGemma 2 | text: speed | 0.39x | 1 (3.1/s) | 1.07x | 1.00-1.08x | 0.56x | 1.10x | 1.06x |
+| | images: speed | 0.57x | 1 (0.6/s) | 1.04x | 1.03-1.05x | 0.57x | 1.12x | 1.10x |
+| | caption -> figure MRR change | | | -0.718 | +0.016 | -0.001 | +0.032 [+0.010, +0.055] | +0.032 [+0.012, +0.054] |
 
-ORT's int8 vectors are bit-identical on Zen 2 and Zen 3 (same MLAS AVX2 kernel), so their fidelity is the same.
+Int8 vectors are bit-identical on Zen 2 and Zen 3 for both ORT's schemes and `q8blk` (same AVX2 code path), so
+fidelity there is the Zen 3 table's.
 
 Notes:
 - **Neighbour overlap** (each item's top 10 among the other 1,198 items, variant vs fp32): `q8blk-b32` 0.93-0.98 (EmbeddingGemma 2 images on Zen 3: 0.86),
