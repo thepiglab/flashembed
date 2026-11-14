@@ -52,6 +52,26 @@ struct FeErr : std::runtime_error {
   } while (0)
 
 enum { DT_F32 = 0, DT_BF16 = 1 };
+
+// optional cuDNN fused attention (cuda/fe_cudnn.cu; a stub unless built with FLASHEMBED_CUDNN_INCLUDE)
+extern "C" {
+const char* fecd_error();
+void* fecd_new(void* stream);
+int fecd_attn(void* ctx, int nb, int smax, int Hq, int Hkv, int D, int window, float scale, const void* q, const void* k,
+              const void* v, void* o, int ld, int ld_out, const int* rag, const int* rago, const int* sl);
+int fecd_graphs(void* ctx);
+size_t fecd_bytes(void* ctx);
+void fecd_free(void* ctx);
+}
+__global__ void k_cd_meta(const int* cu, int n, int nb, int ld, int ld_out, int* rag, int* rago, int* sl) {
+  const int b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b > nb) return;
+  const int c = cu[b < n ? b : n];
+  rag[b] = c * ld;
+  rago[b] = c * ld_out;
+  if (b < nb) sl[b] = b < n ? cu[b + 1] - cu[b] : 0;
+}
+
 enum { ARCH_GEMMA = 0, ARCH_NEOMME = 1 };
 
 // ------------------------------------------------------------------------------------------------- device helpers
@@ -1673,6 +1693,10 @@ struct Engine {
   std::unordered_map<std::string, cublasLtMatmulAlgo_t> algos;
   cudaStream_t st = nullptr;
   cublasHandle_t cb = nullptr;
+  void* cd = nullptr;  // cuDNN attention context (bf16), cd_state: 0 untried, 1 on, -1 off
+  int cd_state = 0;
+  int* cd_meta = nullptr;  // ragged offsets / lengths for cuDNN, 3 x cd_cap ints
+  int cd_cap = 0;
   void* ws = nullptr;
   std::unordered_map<std::string, DBuf> raw;           // uploaded bf16 tensors by name
   std::unordered_map<std::string, std::vector<int64_t>> shapes;
@@ -2059,7 +2083,14 @@ struct Meta {
   int* x1 = nullptr;  // extra arrays (vision slots / NeoMME patch rows)
   int* x2 = nullptr;
   int* x3 = nullptr;
+  int nseq = 0, smax = 0, ntok = 0;  // host copies (cuDNN attention)
 };
+void set_seqs(Meta& m, const std::vector<int>& cu) {
+  m.nseq = (int)cu.size() - 1;
+  m.ntok = cu.empty() ? 0 : cu.back();
+  m.smax = 0;
+  for (int s = 0; s < m.nseq; ++s) m.smax = std::max(m.smax, cu[s + 1] - cu[s]);
+}
 
 // pack host int arrays into the pinned buffer, copy once, return device pointers
 struct Packer {
@@ -2146,9 +2177,84 @@ bool force_simt() {
   return v;
 }
 
+// NeoMME after cuDNN attention: exclusive self-attention against the token's own value vector, then the sigmoid
+// gate (the same math as the k_attn_mma epilogue, from the bf16 attention output). One warp per (token, head).
+template <int D>
+__global__ void k_excl_gate(AttnArgs a, int ntok) {
+  constexpr int CPL = D / 32;
+  const int w = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+  if (w >= ntok * a.Hq) return;
+  const int row = w / a.Hq, h = w % a.Hq, hk = h / (a.Hq / a.Hkv);
+  const bf16* base = (const bf16*)a.qkv + (size_t)row * a.ld;
+  bf16* out = (bf16*)a.out + (size_t)row * a.ld_out + h * D;
+  float o[CPL], v[CPL], vn = 0.f, dot = 0.f;
+#pragma unroll
+  for (int c = 0; c < CPL; ++c) {
+    o[c] = __bfloat162float(out[lane + 32 * c]);
+    v[c] = __bfloat162float(base[a.v_off + hk * D + lane + 32 * c]);
+    vn += v[c] * v[c];
+    dot += o[c] * v[c];
+  }
+  vn = warp_sum(vn);
+  dot = warp_sum(dot);
+  const float nrm = fmaxf(sqrtf(vn), 1e-12f), proj = dot / (nrm * nrm), ta = a.alpha_t[h];
+#pragma unroll
+  for (int c = 0; c < CPL; ++c) {
+    const float g = __bfloat162float(base[a.g_off + h * D + lane + 32 * c]);
+    out[lane + 32 * c] = __float2bfloat16((o[c] - ta * proj * v[c]) / (1.f + expf(-g)));
+  }
+}
+
+// cuDNN attention with FLASHEMBED_ATTN=cudnn (opt-in while it is being evaluated); off for the run after a failure
+bool use_cudnn(Engine& e) {
+  if (e.cd_state == 0) {
+    const char* x = getenv("FLASHEMBED_ATTN");
+    const std::string v = x ? x : "";
+    if (v != "cudnn") {
+      e.cd_state = -1;
+    } else {
+      e.cd = fecd_new(e.st);
+      e.cd_state = e.cd ? 1 : -1;
+      if (!e.cd && v == "cudnn") throw FeErr(std::string("FLASHEMBED_ATTN=cudnn: ") + fecd_error());
+    }
+  }
+  return e.cd_state == 1;
+}
+
 template <typename T>
 void attention(Engine& e, int D, const AttnArgs& a0, const Meta& m) {
   AttnArgs a = a0;
+  if (std::is_same<T, bf16>::value && m.nseq > 0 && use_cudnn(e)) {
+    const bf16* b = (const bf16*)a.qkv;
+    int nb = 1;
+    while (nb < m.nseq) nb <<= 1;  // power-of-two sequence slots: few distinct cuDNN graphs
+    if (nb + 1 > e.cd_cap) {
+      if (e.cd_meta) CK(cudaFree(e.cd_meta));
+      e.cd_cap = std::max(nb + 1, 1024);
+      CK(cudaMalloc(&e.cd_meta, (size_t)3 * e.cd_cap * sizeof(int)));
+    }
+    int *rag = e.cd_meta, *rago = rag + e.cd_cap, *sl = rago + e.cd_cap;
+    k_cd_meta<<<(nb + 1 + 255) / 256, 256, 0, e.st>>>(a.cu, m.nseq, nb, a.ld, a.ld_out, rag, rago, sl);
+    CK(cudaGetLastError());
+    if (fecd_attn(e.cd, nb, m.smax, a.Hq, a.Hkv, D, a.window, a.scale, b + a.q_off, b + a.k_off, b + a.v_off, a.out,
+                  a.ld, a.ld_out, rag, rago, sl) == 0) {
+      if (a.alpha_t) {
+        REQ(D == 64 || D == 128 || D == 256, "exclusive attention head dim");
+        const size_t thr = (size_t)m.ntok * a.Hq * 32;
+        const int nb = (int)((thr + 255) / 256);
+        if (D == 64) k_excl_gate<64><<<nb, 256, 0, e.st>>>(a, m.ntok);
+        else if (D == 128) k_excl_gate<128><<<nb, 256, 0, e.st>>>(a, m.ntok);
+        else k_excl_gate<256><<<nb, 256, 0, e.st>>>(a, m.ntok);
+        CK(cudaGetLastError());
+      }
+      return;
+    }
+    if (getenv("FLASHEMBED_ATTN") && std::string(getenv("FLASHEMBED_ATTN")) == "cudnn")
+      throw FeErr(std::string("cuDNN attention: ") + fecd_error());
+    fprintf(stderr, "flashembed-gpu: cuDNN attention unavailable for this shape (%s); using the built-in kernels\n",
+            fecd_error());
+    e.cd_state = -1;
+  }
   if (std::is_same<T, bf16>::value && !force_simt()) {
     a.tiles = m.tiles64;
     if (!m.nt64) return;
@@ -2648,6 +2754,7 @@ void gemma_vision(Engine& e, int npatch, int nimg, const std::vector<int>& vcu, 
   if (im.src) pk.add(im.desc, (size_t)nimg * D_N);
   auto d = pk.go();
   Meta m;
+  set_seqs(m, vcu);
   m.cu = d[0];
   m.pos = d[1];
   m.tiles16 = (int2*)d[2];
@@ -2791,6 +2898,7 @@ void gemma_text(Engine& e, int ntok, int nseq, const int* ids, const int* cu_h, 
   if (mm_idx) pk.add(mm_idx, ntok);
   auto d = pk.go();
   Meta m;
+  set_seqs(m, cu);
   m.ids = d[0];
   m.cu = d[1];
   m.pos = d[2];
@@ -2842,6 +2950,7 @@ void neomme(Engine& e, int ntok, int nseq, const int* ids, const int* cu_h, cons
   pk.add(t64.host.data(), t64.host.size());
   auto d = pk.go();
   Meta m;
+  set_seqs(m, cu);
   m.ids = d[0];
   m.cu = d[1];
   m.pos = d[2];
@@ -3096,9 +3205,101 @@ int fe_mem(void* h, uint64_t* out) {
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
     out[0] = e.weight_bytes;
-    out[1] = e.arena_bytes;
+    out[1] = e.arena_bytes + fecd_bytes(e.cd) + (size_t)3 * e.cd_cap * sizeof(int);
     out[2] = tot - fr;
     out[3] = tot;
+  });
+}
+
+// attention micro-benchmark: nseq packed sequences of S tokens, random bf16 / fp32 q, k, v; mean ms per call
+int fe_attn_bench(int dtype, int D, int Hq, int Hkv, int S, int nseq, int window, int iters, float* ms) {
+  return guard([&] {
+    Engine e;
+    e.dt = dtype;
+    CK(cudaStreamCreateWithFlags(&e.st, cudaStreamNonBlocking));
+    const int ntok = S * nseq, ld = (Hq + 2 * Hkv) * D;
+    const size_t es = dtype == DT_BF16 ? 2 : 4;
+    void *qkv = nullptr, *out = nullptr, *dm = nullptr;
+    CK(cudaMalloc(&qkv, (size_t)ntok * ld * es));
+    CK(cudaMalloc(&out, (size_t)ntok * Hq * D * es));
+    std::vector<int> cu(nseq + 1);
+    for (int i = 0; i <= nseq; ++i) cu[i] = i * S;
+    Tiles t;
+    build_tiles(cu, 64, t);
+    const size_t cpad = (cu.size() + 63) / 64 * 64;  // keep the int2 tile array 8-byte (here 256-byte) aligned
+    CK(cudaMalloc(&dm, (cpad + t.host.size()) * 4));
+    CK(cudaMemcpy(dm, cu.data(), cu.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy((int*)dm + cpad, t.host.data(), t.host.size() * 4, cudaMemcpyHostToDevice));
+    {  // deterministic pseudo-random fill in [-1, 1)
+      std::vector<uint16_t> hb;
+      std::vector<float> hf;
+      const size_t n = (size_t)ntok * ld;
+      uint32_t x = 12345;
+      if (dtype == DT_BF16) {
+        hb.resize(n);
+        for (auto& v : hb) { x = x * 1664525u + 1013904223u; float f = (x >> 8) * (2.f / 16777216.f) - 1.f; uint32_t u; std::memcpy(&u, &f, 4); v = (uint16_t)(u >> 16); }
+        CK(cudaMemcpy(qkv, hb.data(), n * 2, cudaMemcpyHostToDevice));
+      } else {
+        hf.resize(n);
+        for (auto& v : hf) { x = x * 1664525u + 1013904223u; v = (x >> 8) * (2.f / 16777216.f) - 1.f; }
+        CK(cudaMemcpy(qkv, hf.data(), n * 4, cudaMemcpyHostToDevice));
+      }
+    }
+    Meta m;
+    set_seqs(m, cu);
+    m.cu = (int*)dm;
+    m.tiles64 = (int2*)((int*)dm + cpad);
+    m.nt64 = t.n;
+    Tiles t16, t32;
+    build_tiles(cu, 16, t16);
+    build_tiles(cu, 32, t32);
+    void* dm2 = nullptr;
+    const size_t t16pad = (t16.host.size() + 63) / 64 * 64;
+    CK(cudaMalloc(&dm2, (t16pad + t32.host.size()) * 4));
+    CK(cudaMemcpy(dm2, t16.host.data(), t16.host.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy((int*)dm2 + t16pad, t32.host.data(), t32.host.size() * 4, cudaMemcpyHostToDevice));
+    m.tiles16 = (int2*)dm2;
+    m.nt16 = t16.n;
+    m.tiles32 = (int2*)((int*)dm2 + t16pad);
+    m.nt32 = t32.n;
+    AttnArgs a{};
+    a.qkv = qkv;
+    a.ld = ld;
+    a.q_off = 0;
+    a.k_off = Hq * D;
+    a.v_off = (Hq + Hkv) * D;
+    a.Hq = Hq;
+    a.Hkv = Hkv;
+    a.window = window;
+    a.scale = 1.f / sqrtf((float)D);
+    a.cu = m.cu;
+    a.out = out;
+    a.ld_out = Hq * D;
+    auto run = [&] {
+      if (dtype == DT_BF16) attention<bf16>(e, D, a, m);
+      else attention<float>(e, D, a, m);
+    };
+    run();
+    CK(cudaStreamSynchronize(e.st));
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0));
+    CK(cudaEventCreate(&e1));
+    CK(cudaEventRecord(e0, e.st));
+    for (int i = 0; i < iters; ++i) run();
+    CK(cudaEventRecord(e1, e.st));
+    CK(cudaEventSynchronize(e1));
+    CK(cudaEventElapsedTime(ms, e0, e1));
+    *ms /= iters;
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    cudaFree(qkv);
+    cudaFree(out);
+    cudaFree(dm);
+    cudaFree(dm2);
+    if (e.cd) fecd_free(e.cd);
+    if (e.cd_meta) cudaFree(e.cd_meta);
+    cudaStreamDestroy(e.st);
+    e.st = nullptr;
   });
 }
 
@@ -3119,6 +3320,8 @@ void fe_free(void* h) {
   Engine* e = (Engine*)h;
   if (!e) return;
   cudaStreamSynchronize(e->st);
+  if (e->cd) fecd_free(e->cd);
+  if (e->cd_meta) cudaFree(e->cd_meta);
   for (auto& kv : e->raw) cudaFree(kv.second.p);
   for (void* p : e->owned) cudaFree(p);
   if (e->pin) cudaFreeHost(e->pin);

@@ -34,6 +34,9 @@ unsafe extern "C" {
     fn fe_mem(h: *mut c_void, out: *mut u64) -> c_int;
     fn fe_device_name(buf: *mut c_char, n: c_int) -> c_int;
     fn fe_smem_optin() -> c_int;
+    fn fe_attn_bench(
+        dtype: c_int, d: c_int, hq: c_int, hkv: c_int, s: c_int, nseq: c_int, window: c_int, iters: c_int, ms: *mut f32,
+    ) -> c_int;
     fn fe_free(h: *mut c_void);
 }
 
@@ -82,6 +85,14 @@ pub struct MemInfo {
 }
 
 /// Opt-in shared memory per block (bytes) of the current GPU.
+/// Attention kernel alone: `nseq` packed sequences of `s` tokens (window < 0: full), mean ms per call.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_bench(fp32: bool, d: i32, hq: i32, hkv: i32, s: i32, nseq: i32, window: i32, iters: i32) -> Result<f32> {
+    let mut ms = 0f32;
+    ck(unsafe { fe_attn_bench(if fp32 { 0 } else { 1 }, d, hq, hkv, s, nseq, window, iters, &mut ms) })?;
+    Ok(ms)
+}
+
 pub fn smem_optin() -> usize {
     unsafe { fe_smem_optin() }.max(0) as usize
 }

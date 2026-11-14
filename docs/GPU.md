@@ -225,6 +225,39 @@ Adding video and audio does not change text or images: their vectors are bit-ide
 alternating runs on the same inputs give the same speed within noise (text 1,944 vs 1,951 items/s, images 246 vs
 243 items/s, at 1 CPU core).
 
+### Persistent mode (`serve`)
+
+`flashembed-gpu serve` loads the model once and then takes one request per stdin line, for corpus runs that
+embed many small bundles. It uses the same protocol as the CPU runner's `serve`.
+
+```bash
+flashembed-gpu serve --model gemma --snapshot <snapshot> --dtype bf16 --modalities text,image
+# stdout: {"ready": true, "model": "gemma", "modalities": ["text", "image"], "load_s": ..., ...}
+# stdin:  {"id": "b1/text", "modality": "text", "input": "/data/b1/text.jsonl", "out": "/out/b1/text"}
+# stdout: {"id": "b1/text", "ok": true, "items": 5261, "failed": [], "seconds": 2.1, "items_per_s": ..., "out": ...}
+```
+
+- **Outputs:** each request writes the same files as `embed`.
+- **Failures:**
+  - Item-level failures (bad JSON row, undecodable file, too many tokens) are listed in `failed`. The other items are
+    still embedded and written.
+  - A request that can't be read, or embeds nothing, returns `ok: false` with an `error`.
+  - A GPU error fails that batch's items.
+  - The server keeps going after any failure and exits at end of input.
+- **Pipelining:** a preprocessing thread works through the requests in order. It prepares the next request's batches
+  while the GPU runs the current one.
+- **Output parity:** vectors are bit-identical to `embed` on the same inputs.
+
+On 20 real corpus bundles (124,250 text and figure units per model, B200, 8 CPU cores), compared with one `embed`
+process per bundle and modality:
+
+| model | per-bundle `embed` | `serve` | speed-up |
+|---|---|---|---|
+| EmbeddingGemma 2 | 598 items/s (208 s) | 1,376 items/s (90 s) | 2.3x |
+| NeoMME | 657 items/s (189 s) | 1,356 items/s (92 s) | 2.1x |
+
+Startup (load + warm-up) takes 2-3 s and happens once instead of once per invocation.
+
 ## Build and run
 
 ```bash
@@ -238,7 +271,9 @@ Options: `--dtype bf16|fp32`, `--max-tokens` (tokens per forward, default 32768;
 `--max-patches` (image patches per forward), `--max-items`, `--max-len`, `--side document|query` (NeoMME), `--no-late`,
 `--dim` (EmbeddingGemma 2 Matryoshka size), `--warmup`, `--prep-only` (time the CPU preprocessing alone).
 Output files are the same as `flashembed embed`'s, plus `embeddings.json` with throughput and GPU memory.
-Environment: `FLASHEMBED_ATTN=simt` forces the plain SIMT attention kernels; `FLASHEMBED_FP32_GEMM=sgemm` runs FP32
+Environment: `FLASHEMBED_ATTN=simt` forces the plain SIMT attention kernels; `FLASHEMBED_ATTN=cudnn` (experimental,
+needs a build with `FLASHEMBED_CUDNN_INCLUDE` pointing at the cuDNN >= 9.10 and cudnn-frontend headers, and
+`libcudnn.so.9` at run time) uses cuDNN's fused attention for bf16; `FLASHEMBED_FP32_GEMM=sgemm` runs FP32
 GEMMs as plain SGEMM instead of cuBLAS's BF16x9 FP32 emulation (see Precision); `--quant fp8|nvfp4` is described
 above.
 

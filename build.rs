@@ -3,7 +3,9 @@
 // highest one is embedded too, so newer GPUs JIT it).
 fn main() {
     println!("cargo:rerun-if-changed=cuda/fegpu.cu");
+    println!("cargo:rerun-if-changed=cuda/fe_cudnn.cpp");
     println!("cargo:rerun-if-env-changed=FLASHEMBED_CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=FLASHEMBED_CUDNN_INCLUDE");
     if std::env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
     }
@@ -11,6 +13,21 @@ fn main() {
     let mut b = cc::Build::new();
     b.cuda(true).cudart("shared").file("cuda/fegpu.cu").flag("-O3").flag("-std=c++17")
         .flag("-lineinfo").flag("-Xptxas=-v").warnings(false);
+    // Optional cuDNN fused attention: FLASHEMBED_CUDNN_INCLUDE = ':'-separated dirs holding cudnn.h (cuDNN >= 9.10)
+    // and cudnn_frontend.h (NVIDIA cudnn-frontend, MIT). libcudnn.so.9 is dlopen'ed at run time, not linked.
+    let cudnn = std::env::var("FLASHEMBED_CUDNN_INCLUDE").ok().filter(|s| !s.is_empty());
+    let mut c = cc::Build::new();
+    c.cpp(true).file("cuda/fe_cudnn.cpp").flag("-std=c++17").flag("-O2").warnings(false);
+    if let Some(home) = std::env::var_os("CUDA_HOME").or_else(|| std::env::var_os("CUDA_PATH")) {
+        c.include(std::path::PathBuf::from(home).join("include"));
+    }
+    if let Some(dirs) = &cudnn {
+        for d in dirs.split(':').filter(|d| !d.is_empty()) {
+            c.include(d);
+        }
+        c.define("FE_CUDNN", None);
+    }
+    c.compile("fe_cudnn");
     let list: Vec<&str> = archs.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
     for a in &list {
         b.flag(format!("-gencode=arch=compute_{a},code=sm_{a}"));
@@ -29,4 +46,7 @@ fn main() {
     println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=stdc++");
+    if cudnn.is_some() {
+        println!("cargo:rustc-link-lib=dl");
+    }
 }
