@@ -1,7 +1,12 @@
-// With feature `cuda`: compile cuda/fegpu.cu with nvcc (CUDA_HOME or nvcc on PATH) and link cudart + cuBLAS.
+// 1. ONNX protobuf types for the graph rewriter (src/quant.rs), compiled with protox (pure Rust; no protoc needed).
+// 2. With feature `cuda`: compile cuda/fegpu.cu with nvcc (CUDA_HOME or nvcc on PATH) and link cudart + cuBLAS.
 // FLASHEMBED_CUDA_ARCH: comma-separated SM versions (default "100,120": B200 and RTX PRO 6000 Blackwell; PTX for the
 // highest one is embedded too, so newer GPUs JIT it).
 fn main() {
+    println!("cargo:rerun-if-changed=proto/onnx.proto");
+    let fds = protox::compile(["proto/onnx.proto"], ["proto"]).expect("proto/onnx.proto");
+    prost_build::Config::new().compile_fds(fds).expect("prost codegen");
+
     println!("cargo:rerun-if-changed=cuda/fegpu.cu");
     println!("cargo:rerun-if-changed=cuda/fe_cudnn.cpp");
     println!("cargo:rerun-if-env-changed=FLASHEMBED_CUDA_ARCH");

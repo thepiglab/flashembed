@@ -291,7 +291,7 @@ impl Operator for FlashAttention {
 }
 
 pub fn domain() -> ort::Result<OperatorDomain> {
-    OperatorDomain::new("flashembed")?.add(FlashAttention)?.add(AudioChunkAttention)?.add(ChannelLayerNorm)
+    OperatorDomain::new("flashembed")?.add(FlashAttention)?.add(AudioChunkAttention)?.add(ChannelLayerNorm)?.add(crate::qgemm::QMatMul)
 }
 
 #[derive(Clone, Copy)]

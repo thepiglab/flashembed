@@ -5,7 +5,7 @@
 //!   <out>/rs-<model>-<modality>-t<T>-b<B>.json        timings, peak RSS, CPU model
 //!   ... .dense.npy / .late.npy / .late_offsets.npy   vectors (with --save)
 
-use flashembed::{flash, media, prep};
+use flashembed::{flash, media, prep, quant};
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -34,6 +34,23 @@ enum Cmd {
     Bench(BenchArgs),
     /// Persistent server: load once, then embed one jsonl file per stdin request line (JSON in, JSON out).
     Serve(ServeArgs),
+    /// Write a quantized variant of an fp32 graph directory (src/quant.rs, docs/QUANTIZATION.md).
+    Quantize(quant::QuantizeArgs),
+    /// Activation ranges for static int8 (qdq8): run `bench` inputs through a `quantize --scheme calib` graph dir.
+    Calib(CalibArgs),
+    /// Vector fidelity of a variant's `bench --save` outputs against fp32 (cosine, neighbours, caption->figure).
+    Fidelity(flashembed::fidelity::FidelityArgs),
+    /// Markdown tables (docs/QUANTIZATION.md) from slurm/qbench.sbatch output dirs.
+    Qreport(flashembed::qreport::QreportArgs),
+}
+
+#[derive(clap::Args)]
+struct CalibArgs {
+    #[command(flatten)]
+    bench: BenchArgs,
+    /// output json {graph: {tensor: range}}; merged into an existing file
+    #[arg(long)]
+    calib_out: PathBuf,
 }
 
 #[derive(clap::Args)]
@@ -90,7 +107,7 @@ impl EmbedArgs {
             model: self.model, modality: self.modality, threads, batch: self.batch, n: usize::MAX, warmup: 0, max_len,
             inputs: dir, onnx: self.onnx, snapshot: self.snapshot, out: self.out, save: true, texts_file: file.clone(),
             images_file: file, side: self.side, tag_suffix: String::new(), max_soft_tokens: self.max_soft_tokens,
-            decode_in_loop: true, no_sort: false, plain_names: true, dim: self.dim, no_late: self.no_late,
+            decode_in_loop: true, no_sort: false, plain_names: true, dim: self.dim, no_late: self.no_late, calib: false,
         })
     }
 }
@@ -170,6 +187,9 @@ struct BenchArgs {
     /// NeoMME: dense vectors only (skip collecting and writing the late-interaction vectors)
     #[arg(long)]
     no_late: bool,
+    /// set by `calib`: collect activation ranges of the calib graph's extra outputs
+    #[arg(skip)]
+    calib: bool,
 }
 
 fn oe<T, E: std::fmt::Display>(r: std::result::Result<T, E>) -> Result<T> {
@@ -373,6 +393,29 @@ struct Runner {
     no_late: bool,
     /// seconds inside Session::run (model forward), accumulated; the rest of a batch is Rust prep/post
     infer_s: f64,
+    /// `calib`: graph file stem of each session, and the activation ranges seen so far
+    graphs: [String; 3],
+    calib: Option<Calib>,
+}
+
+/// graph name -> activation tensor -> range (static int8 calibration)
+type Calib = std::collections::BTreeMap<String, std::collections::BTreeMap<String, quant::Range>>;
+
+/// Record min/max of every calib-graph output (MatMul activation inputs exposed by `quantize --scheme calib`).
+fn observe(calib: &mut Option<Calib>, graph: &str, outs: &ort::session::SessionOutputs) -> Result<()> {
+    let Some(c) = calib.as_mut() else { return Ok(()) };
+    let names: Vec<String> = c.get(graph).map(|m| m.keys().cloned().collect()).unwrap_or_default();
+    for n in names {
+        let (_, x) = oe(outs[n.as_str()].try_extract_tensor::<f32>())?;
+        let (lo, hi) = x.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+        let r = c.get_mut(graph).unwrap().get_mut(&n).unwrap();
+        let k = r.batches as f32;
+        if r.batches == 0 { r.lo = lo; r.hi = hi; } else { r.lo = r.lo.min(lo); r.hi = r.hi.max(hi); }
+        r.lo_avg = (r.lo_avg * k + lo) / (k + 1.0);
+        r.hi_avg = (r.hi_avg * k + hi) / (k + 1.0);
+        r.batches += 1;
+    }
+    Ok(())
 }
 
 impl Runner {
@@ -418,6 +461,25 @@ impl Runner {
                 }
             }
         }
+        // calibration (`calib`): graph file stem per session slot (main, vision, audio), from the first modality
+        let m0 = mods[0];
+        let vision_dyn = m0 == Modality::Video || (m0 == Modality::Image && (a.max_soft_tokens != prep::G_SOFT || !vision_full()));
+        let graphs = [
+            match (a.model, m0) { (ModelKind::Gemma, _) => "gemma_lm", (ModelKind::Neomme, Modality::Image) => "neomme_image", _ => "neomme_text" }.to_string(),
+            (if vision_dyn { "gemma_vision_dyn" } else { "gemma_vision" }).to_string(),
+            "gemma_audio".to_string(),
+        ];
+        let calib = if a.calib {
+            let mut c = Calib::new();
+            for g in &graphs {
+                let p = a.onnx.join(format!("{g}.onnx"));
+                if p.exists() {
+                    let names = quant::calib_outputs(&p)?;
+                    c.insert(g.clone(), names.into_iter().map(|n| (n, quant::Range::default())).collect());
+                }
+            }
+            Some(c)
+        } else { None };
         let (pad_id, image_id, doc_id, row_id) = match a.model {
             ModelKind::Gemma => (prep::token_id(&tok, "<pad>")?, prep::token_id(&tok, "<|image|>")?, -1, -1),
             ModelKind::Neomme => (
@@ -439,7 +501,7 @@ impl Runner {
         Ok(Self {
             _env: env, kind: a.model, modality: mods[0], tok, main, nimg, vision, vision_vid, audio,
             mel: media::MelExtractor::new(), soft_budget: a.max_soft_tokens, video_id, audio_id,
-            pad_id, image_id, doc_id, row_id, query, no_late: a.no_late, infer_s: 0.0,
+            pad_id, image_id, doc_id, row_id, query, no_late: a.no_late, infer_s: 0.0, graphs, calib,
         })
     }
 
@@ -473,6 +535,7 @@ impl Runner {
                     "attention_mask" => oe(Tensor::from_array(([b, s], mask.clone())))?,
                 ]))?;
                 self.infer_s += t.elapsed().as_secs_f64();
+                observe(&mut self.calib, &self.graphs[0], &outs)?;
                 neomme_outputs(&outs, &mask, b, s, self.no_late)
             }
             (ModelKind::Neomme, Modality::Image) => self.neomme_image(items),
@@ -511,6 +574,7 @@ impl Runner {
             "mm_mask" => oe(Tensor::from_array(([b, s], mm_mask)))?,
         ]))?;
         self.infer_s += t.elapsed().as_secs_f64();
+        observe(&mut self.calib, &self.graphs[0], &outs)?;
         let (shape, hs) = oe(outs["last_hidden_state"].try_extract_tensor::<f32>())?;
         let d = shape[2] as usize;
         // sentence-transformers Pooling(mean, include_prompt) + Normalize
@@ -558,6 +622,7 @@ impl Runner {
             "image_position_ids" => oe(Tensor::from_array(([b, p, 2], pp)))?,
         ]))?;
         self.infer_s += t.elapsed().as_secs_f64();
+        observe(&mut self.calib, &self.graphs[1], &outs)?;
         let (shape, sv) = oe(outs["soft_tokens"].try_extract_tensor::<f32>())?;
         let (l, h) = (shape[1] as usize, shape[2] as usize);
         let (_, smask) = oe(outs["soft_mask"].try_extract_tensor::<bool>())?;
@@ -677,6 +742,7 @@ impl Runner {
             "input_features_mask" => oe(Tensor::from_array(([b, t_frames], masks)))?,
         ]))?;
         self.infer_s += t.elapsed().as_secs_f64();
+        observe(&mut self.calib, &self.graphs[2], &outs)?;
         let (shape, sv) = oe(outs["soft_tokens"].try_extract_tensor::<f32>())?;
         let (l, h) = (shape[1] as usize, shape[2] as usize);
         let sv = sv.to_vec();
@@ -752,6 +818,7 @@ impl Runner {
             "patch_mask" => oe(Tensor::from_array(([b, s], patch_mask)))?,
         ]))?;
         self.infer_s += t.elapsed().as_secs_f64();
+        observe(&mut self.calib, &self.graphs[0], &outs)?;
         neomme_outputs(&outs, &mask, b, s, self.no_late)
     }
 }
@@ -948,6 +1015,7 @@ fn embed_run(r: &mut Runner, a: &BenchArgs, ids: &[String], items: &[Item], load
         "batch": a.batch, "dim": a.dim, "no_late": a.no_late, "n": per.len(), "failed": failed.len(), "warmup_batches": a.warmup, "wall_s": wall,
         "items_per_s": per.len() as f64 / wall, "batch_latency_s": lat, "load_s": load_s,
         "peak_rss_mb": peak_rss_mb(), "tokens_total": ntok, "dtype": "float32",
+        "onnx": a.onnx, "variant": std::env::var("FLASHEMBED_VARIANT").unwrap_or_else(|_| "fp32".into()),
         "infer_s": r.infer_s, "prep_post_s": wall - r.infer_s, "side": a.side, "texts_file": a.texts_file,
         "ort": "load-dynamic (ORT_DYLIB_PATH)", "ort_arena": std::env::var("FLASHEMBED_ORT_ARENA").is_ok_and(|v| v == "1"), "ort_thread_policy": pol.name, "ort_intra_threads": pol.threads, "policy_tuning": tuning, "ort_config": std::env::var("FLASHEMBED_ORT_CONFIG").unwrap_or_default(), "ort_dylib": std::env::var("ORT_DYLIB_PATH").unwrap_or_default(),
         "cpu": cpu_model(), "host": std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim(),
@@ -979,7 +1047,7 @@ fn embed_run(r: &mut Runner, a: &BenchArgs, ids: &[String], items: &[Item], load
     Ok((res, per.len(), failed))
 }
 
-fn bench(a: BenchArgs) -> Result<()> {
+fn bench(a: BenchArgs) -> Result<Option<Calib>> {
     check_dim(&a)?;
     let t_load = Instant::now();
     let (ids, items) = load_items(&a.inputs, a.modality, a.n, &a)?;
@@ -993,7 +1061,7 @@ fn bench(a: BenchArgs) -> Result<()> {
     let load_s = t_load.elapsed().as_secs_f64();
     let (brief, _, _) = embed_run(&mut r, &a, &ids, &items, load_s, &pol, &tuning, false, json!({}))?;
     println!("{brief}");
-    Ok(())
+    Ok(r.calib.take())
 }
 
 #[derive(clap::Args)]
@@ -1050,7 +1118,7 @@ fn serve(s: ServeArgs) -> Result<()> {
         inputs: PathBuf::from("."), onnx: s.onnx, snapshot: s.snapshot, out: PathBuf::from("."), save: true,
         texts_file: String::new(), images_file: String::new(), side: s.side, tag_suffix: String::new(),
         max_soft_tokens: s.max_soft_tokens, decode_in_loop: true, no_sort: false, plain_names: true, dim: s.dim,
-        no_late: s.no_late,
+        no_late: s.no_late, calib: false,
     };
     check_dim(&base)?;
     // synthetic tuning / warm-up batch: full-length texts if text is served, else large images
@@ -1168,18 +1236,48 @@ impl BenchArgs {
             max_len: self.max_len, inputs: dir.to_path_buf(), onnx: self.onnx.clone(), snapshot: self.snapshot.clone(),
             out: out.to_path_buf(), save: true, texts_file: file.clone(), images_file: file, side: self.side.clone(),
             tag_suffix: String::new(), max_soft_tokens: self.max_soft_tokens, decode_in_loop: true, no_sort: false,
-            plain_names: true, dim: self.dim, no_late: self.no_late,
+            plain_names: true, dim: self.dim, no_late: self.no_late, calib: false,
         }
     }
 }
 
 fn main() -> Result<()> {
-    if std::env::var("ORT_DYLIB_PATH").is_err() {
+    let cli = Cli::parse();
+    let needs_ort = matches!(cli.cmd, Cmd::Embed(_) | Cmd::Bench(_) | Cmd::Calib(_) | Cmd::Serve(_));
+    if needs_ort && std::env::var("ORT_DYLIB_PATH").is_err() {
         bail!("set ORT_DYLIB_PATH to libonnxruntime.so (the Python onnxruntime wheel's copy)");
     }
-    match Cli::parse().cmd {
-        Cmd::Embed(a) => bench(a.into_bench()?),
-        Cmd::Bench(a) => bench(a),
+    match cli.cmd {
+        Cmd::Embed(a) => bench(a.into_bench()?).map(|_| ()),
+        Cmd::Bench(a) => bench(a).map(|_| ()),
         Cmd::Serve(s) => serve(s),
+        Cmd::Quantize(a) => quant::quantize_cmd(a),
+        Cmd::Fidelity(a) => flashembed::fidelity::run(a),
+        Cmd::Qreport(a) => flashembed::qreport::run(a),
+        Cmd::Calib(mut a) => {
+            a.bench.calib = true;
+            let out = a.calib_out.clone();
+            let got = bench(a.bench)?.unwrap_or_default();
+            // merge with earlier runs (e.g. text then image inputs into the same graph)
+            let mut all: Calib = std::fs::read_to_string(&out).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+            for (g, m) in got {
+                let e = all.entry(g).or_default();
+                for (n, r) in m {
+                    if r.batches == 0 { continue; }
+                    match e.get_mut(&n) {
+                        Some(o) if o.batches > 0 => {
+                            let (k0, k1) = (o.batches as f32, r.batches as f32);
+                            o.lo = o.lo.min(r.lo); o.hi = o.hi.max(r.hi);
+                            o.lo_avg = (o.lo_avg * k0 + r.lo_avg * k1) / (k0 + k1);
+                            o.hi_avg = (o.hi_avg * k0 + r.hi_avg * k1) / (k0 + k1);
+                            o.batches += r.batches;
+                        }
+                        _ => { e.insert(n, r); }
+                    }
+                }
+            }
+            std::fs::write(&out, serde_json::to_string_pretty(&all)?)?;
+            Ok(())
+        }
     }
 }

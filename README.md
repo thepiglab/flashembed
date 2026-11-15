@@ -86,6 +86,9 @@ All in [docs/PROFILING.md](docs/PROFILING.md), with the method and hardware:
 - **Close cases**: repeated runs of the slowest cases, plus a GEMM microbenchmark (torch/MKL, ONNX Runtime/MLAS,
   the `gemm` crate).
 
+Experimental int8 / int4 / bf16 variants of the CPU path (not the default; speed, fidelity and a pending retrieval
+check): [docs/QUANTIZATION.md](docs/QUANTIZATION.md).
+
 How it works, why ONNX Runtime plus Rust kernels (and not candle or stock ONNX Runtime), and what it took to match
 the reference preprocessing bit for bit: [docs/DESIGN.md](docs/DESIGN.md).
 
@@ -180,7 +183,8 @@ anything, and `flashembed_sbatch` (a drop-in for `sbatch`) refuses to submit it.
 | `src/flash.rs` | custom ops: FlashAttention, AudioChunkAttention, ChannelLayerNorm |
 | `src/prep.rs`, `src/pil_resize.rs` | tokenization, EmbeddingGemma 2 / NeoMME image preprocessing, Pillow/ATen-exact resize |
 | `src/media.rs` | FFmpeg audio/video decoding, Gemma 4 log-mel features, video frame sampling |
-| `src/bin/` | `flash-check` (kernel test), `linear-bench` (GEMM), `candle-neomme` / `gemm-bench` (backend evidence, feature `candle`) |
+| `src/quant.rs`, `src/fidelity.rs`, `src/qreport.rs` | `quantize` / `calib` / `fidelity` / `qreport` subcommands (quantized graph variants, [docs/QUANTIZATION.md](docs/QUANTIZATION.md)) |
+| `src/bin/` | `flash-check` (kernel test), `qgemm-bench` (quantized GEMM kernels), `linear-bench` (GEMM), `candle-neomme` / `gemm-bench` (backend evidence, feature `candle`) |
 | `py/export_onnx.py` | ONNX export with the custom ops and graph rewrites, parity checks against HF |
 | `py/py_bench.py` | reference runtime benchmark (the model-card Python code path) |
 | `py/make_*.py`, `py/scan_media.py` | benchmark inputs from the PMC open-access subset (+ synthetic media) |
