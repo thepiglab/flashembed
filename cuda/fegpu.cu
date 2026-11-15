@@ -865,6 +865,17 @@ __global__ void k_mean_pool(const float* __restrict__ x, const int* __restrict__
     out[(size_t)s * n + c] = acc / fmaxf((float)(b - a), 1e-9f);
   }
 }
+// late chunking: mean of rows lo[s] .. hi[s]-1 (packed token indices; spans may overlap)
+__global__ void k_span_pool(const float* __restrict__ x, const int* __restrict__ lo, const int* __restrict__ hi,
+                            float* __restrict__ out, int n) {
+  const int s = blockIdx.x;
+  const int a = lo[s], b = hi[s];
+  for (int c = threadIdx.x; c < n; c += blockDim.x) {
+    float acc = 0.f;
+    for (int t = a; t < b; ++t) acc += x[(size_t)t * n + c];
+    out[(size_t)s * n + c] = acc / fmaxf((float)(b - a), 1e-9f);
+  }
+}
 // in-place row L2 normalisation (F.normalize, eps 1e-12), T in, fp32 out
 template <typename T>
 __global__ void k_l2norm(const T* __restrict__ x, float* __restrict__ y, int n) {
@@ -1695,6 +1706,8 @@ struct Engine {
   cublasHandle_t cb = nullptr;
   void* cd = nullptr;  // cuDNN attention context (bf16), cd_state: 0 untried, 1 on, -1 off
   int cd_state = 0;
+  int* span_buf = nullptr;  // late chunking: span lo | hi, span_cap each
+  int span_cap = 0;
   int* cd_meta = nullptr;  // ragged offsets / lengths for cuDNN, 3 x cd_cap ints
   int cd_cap = 0;
   void* ws = nullptr;
@@ -2878,8 +2891,11 @@ void gemma_audio(Engine& e, int nclip, const int* cu0, const float* feats, const
   e.soft_src = e.a_soft;
 }
 
+// nspan > 0 (late chunking): instead of one mean over each sequence, one vector per token span [span_lo, span_hi)
+// (packed indices): mean of the final hidden states, then the same projection and L2 normalisation
 template <typename T>
-void gemma_text(Engine& e, int ntok, int nseq, const int* ids, const int* cu_h, const int* mm_idx, float* out_host) {
+void gemma_text(Engine& e, int ntok, int nseq, const int* ids, const int* cu_h, const int* mm_idx, float* out_host,
+                int nspan = 0, const int* span_lo = nullptr, const int* span_hi = nullptr) {
   REQ(ntok <= e.max_tok, "batch exceeds max tokens");
   std::vector<int> cu(cu_h, cu_h + nseq + 1), pos(ntok);
   for (int s = 0; s < nseq; ++s)
@@ -2915,6 +2931,29 @@ void gemma_text(Engine& e, int ntok, int nseq, const int* ids, const int* cu_h, 
   resid_norm<T>(e, ntok, H, nullptr, 0, nullptr, 0.f, e.b_h, 1.f, nullptr, 0, 0, 1, e.gl[0].w_in, e.b_y, nullptr);
   gemma_layers<T>(e, ntok, m, e.gl, H, e.Hq, e.I, e.b_y, e.b_qkv, e.b_o, e.b_t1, e.b_gu, e.b_m, e.b_h, true, e.b_t2,
                   e.b_e, 1, e.b_y32, e.w_final);
+  if (nspan > 0) {
+    if (nspan > e.span_cap) {
+      if (e.span_buf) CK(cudaFree(e.span_buf));
+      e.span_cap = std::max(nspan, 4096);
+      CK(cudaMalloc(&e.span_buf, (size_t)2 * e.span_cap * sizeof(int)));
+    }
+    for (int s = 0; s < nspan; ++s)
+      REQ(span_lo[s] >= 0 && span_hi[s] > span_lo[s] && span_hi[s] <= ntok, "span out of range or empty");
+    int* dlo = e.span_buf;
+    int* dhi = e.span_buf + e.span_cap;
+    CK(cudaMemcpyAsync(dlo, span_lo, (size_t)nspan * 4, cudaMemcpyHostToDevice, e.st));
+    CK(cudaMemcpyAsync(dhi, span_hi, (size_t)nspan * 4, cudaMemcpyHostToDevice, e.st));
+    for (int s0 = 0; s0 < nspan; s0 += 4096) {  // b_pool / b_out hold 4096 rows
+      const int n = std::min(4096, nspan - s0);
+      k_span_pool<<<n, 256, 0, e.st>>>(e.b_y32, dlo + s0, dhi + s0, e.b_pool, H);
+      gemm(e, e.b_pool, e.proj_f32, e.b_out, n, DT_F32);
+      k_l2norm<float><<<n, 256, 0, e.st>>>(e.b_out, e.b_out, e.out_dim);
+      CK(cudaGetLastError());
+      CK(cudaMemcpyAsync(out_host + (size_t)s0 * e.out_dim, e.b_out, (size_t)n * e.out_dim * 4, cudaMemcpyDeviceToHost, e.st));
+    }
+    CK(cudaStreamSynchronize(e.st));  // also keeps span_lo / span_hi alive until the copies are done
+    return;
+  }
   k_mean_pool<<<nseq, 256, 0, e.st>>>(e.b_y32, m.cu, e.b_pool, H);
   gemm(e, e.b_pool, e.proj_f32, e.b_out, nseq, DT_F32);
   k_l2norm<float><<<nseq, 256, 0, e.st>>>(e.b_out, e.b_out, e.out_dim);
@@ -3131,6 +3170,17 @@ int fe_gemma_text(void* h, int ntok, int nseq, const int32_t* ids, const int32_t
   });
 }
 
+// late chunking: like fe_gemma_text, but out = [nspan, out_dim], one vector per packed token span [lo, hi)
+int fe_gemma_text_spans(void* h, int ntok, int nseq, const int32_t* ids, const int32_t* cu, int nspan, const int32_t* lo,
+                        const int32_t* hi, float* out) {
+  return guard([&] {
+    Engine& e = *(Engine*)h;
+    REQ(e.arch == ARCH_GEMMA, "late chunking is EmbeddingGemma 2 only");
+    if (e.dt == DT_F32) gemma_text<float>(e, ntok, nseq, ids, cu, nullptr, out, nspan, lo, hi);
+    else gemma_text<bf16>(e, ntok, nseq, ids, cu, nullptr, out, nspan, lo, hi);
+  });
+}
+
 // Gemma 4 vision tower: patches [npatch, 768] (processor values in [0,1]), pos [npatch, 2] (x, y), images packed by
 // vcu [nimg+1]; slots: soft token s averages patches slot_patch[slot_ptr[s]..slot_ptr[s+1]]. Leaves nslot soft tokens
 // on the device for the next fe_gemma_text call (mm_idx refers to them).
@@ -3322,6 +3372,7 @@ void fe_free(void* h) {
   cudaStreamSynchronize(e->st);
   if (e->cd) fecd_free(e->cd);
   if (e->cd_meta) cudaFree(e->cd_meta);
+  if (e->span_buf) cudaFree(e->span_buf);
   for (auto& kv : e->raw) cudaFree(kv.second.p);
   for (void* p : e->owned) cudaFree(p);
   if (e->pin) cudaFreeHost(e->pin);

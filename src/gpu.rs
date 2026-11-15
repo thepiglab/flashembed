@@ -14,6 +14,9 @@ unsafe extern "C" {
     fn fe_add(h: *mut c_void, name: *const c_char, src_dtype: c_int, shape: *const i64, ndim: c_int, data: *const c_void) -> c_int;
     fn fe_build(h: *mut c_void, max_tokens: c_int, max_patches: c_int) -> c_int;
     fn fe_gemma_text(h: *mut c_void, ntok: c_int, nseq: c_int, ids: *const i32, cu: *const i32, mm_idx: *const i32, out: *mut f32) -> c_int;
+    fn fe_gemma_text_spans(
+        h: *mut c_void, ntok: c_int, nseq: c_int, ids: *const i32, cu: *const i32, nspan: c_int, lo: *const i32, hi: *const i32, out: *mut f32,
+    ) -> c_int;
     fn fe_gemma_vision(
         h: *mut c_void, npatch: c_int, nimg: c_int, vcu: *const i32, pos: *const i32, patches: *const f32, nslot: c_int,
         slot_ptr: *const i32, slot_patch: *const i32,
@@ -254,6 +257,15 @@ impl Engine {
         let mut out = vec![0f32; nseq * self.out_dim];
         ck(unsafe {
             fe_gemma_text(self.h, ids.len() as c_int, nseq as c_int, ids.as_ptr(), cu.as_ptr(), mm_idx.map_or(std::ptr::null(), |m| m.as_ptr()), out.as_mut_ptr())
+        })?;
+        Ok(out)
+    }
+
+    /// Late chunking: one vector per packed token span [lo, hi) (mean of final hidden states, projection, L2 norm).
+    pub fn gemma_text_spans(&mut self, ids: &[i32], cu: &[i32], lo: &[i32], hi: &[i32]) -> Result<Vec<f32>> {
+        let mut out = vec![0f32; lo.len() * self.out_dim];
+        ck(unsafe {
+            fe_gemma_text_spans(self.h, ids.len() as c_int, (cu.len() - 1) as c_int, ids.as_ptr(), cu.as_ptr(), lo.len() as c_int, lo.as_ptr(), hi.as_ptr(), out.as_mut_ptr())
         })?;
         Ok(out)
     }

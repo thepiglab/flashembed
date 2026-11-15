@@ -60,6 +60,12 @@ enum Model {
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
 enum Modality {
     Text,
+    /// EmbeddingGemma 2 late chunking: rows {"id", "text", "prefix_chars", "spans": [{"id", "start", "end"}]} (char
+    /// offsets into text); one vector per span: mean of the document's final hidden states over the span's tokens
+    /// (prompt prefix excluded), then the model's projection and L2 normalisation. Documents longer than --max-len go
+    /// through overlapping windows (--late-overlap tokens); each span is pooled in the window where it is most central.
+    #[value(name = "text_late", alias = "text-late")]
+    TextLate,
     Image,
     /// EmbeddingGemma 2 only: ffmpeg decode at 1 fps, <= 32 frames, 140 soft tokens per frame
     Video,
@@ -149,6 +155,9 @@ struct Args {
     /// preprocessing only (no GPU): time the producer thread alone
     #[arg(long)]
     prep_only: bool,
+    /// text_late: tokens shared by consecutive windows of a document longer than --max-len
+    #[arg(long, default_value_t = 1024)]
+    late_overlap: usize,
 }
 
 enum GPrep {
@@ -186,6 +195,130 @@ enum Batch {
         mm: Vec<i32>, items: Vec<usize>, dev: bool, src: Vec<u8>, desc: Vec<i32>, coef: Vec<i32>, tmp: usize, max_pix: usize,
     },
     NeoImage { ids: Vec<i32>, cu: Vec<i32>, pos: Vec<i32>, patches: Vec<u8>, rows: Vec<i32>, items: Vec<usize> },
+    /// late chunking: packed document windows; span s pools tokens lo[s]..hi[s] and belongs to (item, span index)
+    Late { ids: Vec<i32>, cu: Vec<i32>, lo: Vec<i32>, hi: Vec<i32>, refs: Vec<(usize, usize)>, meta: Vec<SpanMeta>, items: Vec<usize> },
+}
+
+/// Per output span: its id, the document window it was pooled in, its token count, and whether it had to be
+/// clipped to that window (span longer than a window) or widened to one token (no token starts inside it).
+#[derive(Clone)]
+struct SpanMeta {
+    id: String,
+    window: usize,
+    windows: usize,
+    tokens: usize,
+    clipped: bool,
+    widened: bool,
+    /// spans of the document (a document's output is complete when all `of` spans are back)
+    of: usize,
+}
+
+/// One text_late document, tokenized and laid out: the windows to run and, per span, (window, lo, hi) token
+/// positions inside that window.
+struct LateDoc {
+    windows: Vec<Vec<i32>>,
+    spans: Vec<(usize, usize, usize, SpanMeta)>,
+}
+
+/// Tokenize a text_late row and place its spans. A span covers the document tokens (not special, not in the prompt
+/// prefix) whose first character is inside [start, end); a span in which no token starts takes the token containing
+/// `start`. Up to `wmax` tokens: one window, the whole tokenized document. Longer: windows of [bos + prefix tokens] +
+/// a body slice + [eos], consecutive slices overlapping by `overlap` tokens; a span goes to the window that contains it
+/// with the largest margin to the slice edges (else the one overlapping it most, clipped to it).
+fn late_doc(tok: &tokenizers::Tokenizer, row: &str, wmax: usize, overlap: usize) -> Result<LateDoc> {
+    let v: serde_json::Value = serde_json::from_str(row)?;
+    let text = v["text"].as_str().context("no text")?;
+    let prefix = v["prefix_chars"].as_u64().unwrap_or(0) as usize;
+    let enc = tok.encode_char_offsets(text, true).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+    let ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
+    let offs = enc.get_offsets();
+    let special = enc.get_special_tokens_mask();
+    let nchar = text.chars().count();
+    let lead: Vec<usize> = (0..ids.len()).take_while(|&k| special[k] == 1).collect();
+    let mut trail: Vec<usize> = (0..ids.len()).rev().take_while(|&k| special[k] == 1 && k >= lead.len()).collect();
+    trail.reverse();
+    let content: Vec<usize> = (lead.len()..ids.len() - trail.len()).collect();
+    let hdr: Vec<usize> = content.iter().copied().take_while(|&k| offs[k].0 < prefix).collect();
+    let body: Vec<usize> = content[hdr.len()..].to_vec();
+    if body.is_empty() {
+        bail!("no document tokens after the {prefix}-character prefix");
+    }
+    let spans = v["spans"].as_array().context("no spans")?;
+    let of = spans.len();
+    // body index range per span
+    let mut placed: Vec<(usize, usize, String, bool)> = Vec::with_capacity(of);
+    for (j, sp) in spans.iter().enumerate() {
+        let id = sp["id"].as_str().map(str::to_string).unwrap_or_else(|| sp["id"].to_string());
+        let (c0, c1) = (sp["start"].as_u64().with_context(|| format!("span {j}: no start"))? as usize, sp["end"].as_u64().with_context(|| format!("span {j}: no end"))? as usize);
+        if c0 >= c1 || c1 > nchar || c0 < prefix {
+            bail!("span {id}: [{c0}, {c1}) is empty, past the text ({nchar} chars) or inside the prefix ({prefix})");
+        }
+        let b0 = body.partition_point(|&k| offs[k].0 < c0);
+        let b1 = body.partition_point(|&k| offs[k].0 < c1);
+        if b0 < b1 {
+            placed.push((b0, b1, id, false));
+        } else {
+            // no token starts inside: the token containing c0 (the previous one), else the next one
+            let b = if b0 > 0 && offs[body[b0 - 1]].1 > c0 { b0 - 1 } else { b0.min(body.len() - 1) };
+            placed.push((b, b + 1, id, true));
+        }
+    }
+    let mut out = LateDoc { windows: vec![], spans: vec![] };
+    if ids.len() <= wmax {
+        out.windows.push(ids.clone());
+        for (b0, b1, id, widened) in placed {
+            let (lo, hi) = (body[b0], body[b1 - 1] + 1);
+            out.spans.push((0, lo, hi, SpanMeta { id, window: 0, windows: 1, tokens: hi - lo, clipped: false, widened, of }));
+        }
+        return Ok(out);
+    }
+    let head: Vec<i32> = lead.iter().chain(&hdr).map(|&k| ids[k]).collect();
+    let tail: Vec<i32> = trail.iter().map(|&k| ids[k]).collect();
+    if head.len() + tail.len() + 16 > wmax {
+        bail!("prompt prefix ({} tokens) leaves no room in a {wmax}-token window", head.len());
+    }
+    let cap = wmax - head.len() - tail.len();
+    let ov = overlap.min(cap / 2);
+    let stride = cap - ov;
+    let mut starts = vec![0usize];
+    while starts.last().unwrap() + cap < body.len() {
+        starts.push(starts.last().unwrap() + stride);
+    }
+    let nw = starts.len();
+    for &s0 in &starts {
+        let e0 = (s0 + cap).min(body.len());
+        let mut w = head.clone();
+        w.extend(body[s0..e0].iter().map(|&k| ids[k]));
+        w.extend_from_slice(&tail);
+        out.windows.push(w);
+    }
+    for (b0, b1, id, widened) in placed {
+        // most central window that holds the whole span, else the one overlapping it most
+        // ties go to the earliest window (max_by_key would take the last)
+        let first_max = |score: &dyn Fn(usize) -> Option<usize>| -> Option<usize> {
+            let mut best: Option<(usize, usize)> = None;
+            for w in 0..nw {
+                if let Some(v) = score(w) {
+                    if best.is_none_or(|b| v > b.1) {
+                        best = Some((w, v));
+                    }
+                }
+            }
+            best.map(|b| b.0)
+        };
+        let end = |s0: usize| (s0 + cap).min(body.len());
+        let full = first_max(&|w| { let s0 = starts[w]; (s0 <= b0 && b1 <= end(s0)).then(|| (b0 - s0).min(end(s0) - b1)) });
+        let (w, clipped) = match full {
+            Some(w) => (w, false),
+            None => (first_max(&|w| Some(b1.min(end(starts[w])).saturating_sub(b0.max(starts[w])))).unwrap(), true),
+        };
+        let s0 = starts[w];
+        let e0 = (s0 + cap).min(body.len());
+        let (x0, x1) = (b0.max(s0), b1.min(e0));
+        let (lo, hi) = (head.len() + x0 - s0, head.len() + x1 - s0);
+        out.spans.push((w, lo, hi, SpanMeta { id, window: w, windows: nw, tokens: hi - lo, clipped, widened, of }));
+    }
+    Ok(out)
 }
 
 struct Ctx {
@@ -258,6 +391,7 @@ fn resolve(a: &mut Args) -> Result<()> {
     a.max_tokens = Some(a.max_tokens.unwrap_or(if gpu::smem_optin() >= 200 * 1024 { 32768 } else { 8192 }));
     a.max_patches = Some(match (a.modality, a.model) {
         (Modality::Text, _) => 0,
+        (Modality::TextLate, Model::Gemma) => 0,
         (Modality::Image, Model::Gemma) => a.max_patches.unwrap_or(40320),
         (Modality::Image, Model::Neomme) => a.max_patches.unwrap_or(16384),
         // one full 32-frame video (32 x 1260 patches) per batch at least
@@ -270,14 +404,9 @@ fn resolve(a: &mut Args) -> Result<()> {
 
 /// Items of one input file: (ids, text or path per item, directory paths are relative to).
 fn read_items(a: &Args) -> Result<(Vec<String>, Vec<String>, PathBuf)> {
-    let dir = a.input_file().parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    let key = if a.modality == Modality::Text { "text" } else { "path" };
-    let (mut ids, mut raw) = (vec![], vec![]);
-    let text = std::fs::read_to_string(&a.input_file()).with_context(|| format!("reading {}", a.input_file().display()))?;
-    for (k, line) in text.lines().filter(|l| !l.trim().is_empty()).take(a.n.unwrap_or(usize::MAX)).enumerate() {
-        let v: serde_json::Value = serde_json::from_str(line).with_context(|| format!("input line {}", k + 1))?;
-        ids.push(v["id"].as_str().unwrap_or_default().to_string());
-        raw.push(v[key].as_str().with_context(|| format!("input line {}: no \"{key}\"", k + 1))?.to_string());
+    let (ids, raw, dir, bad) = read_items_lenient(a)?;
+    if let Some((i, e)) = bad.first() {
+        bail!("input row {i}: {e}");
     }
     Ok((ids, raw, dir))
 }
@@ -289,6 +418,18 @@ fn read_items_lenient(a: &Args) -> Result<(Vec<String>, Vec<String>, PathBuf, Ve
     let (mut ids, mut raw, mut bad) = (vec![], vec![], vec![]);
     let text = std::fs::read_to_string(&a.input_file()).with_context(|| format!("reading {}", a.input_file().display()))?;
     for (k, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()).take(a.n.unwrap_or(usize::MAX)) {
+        if a.modality == Modality::TextLate {
+            // the whole row (text, prefix_chars, spans) goes to the producer, which validates it per document
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(v) if v["text"].is_string() && v["spans"].is_array() => {
+                    ids.push(v["id"].as_str().map(str::to_string).unwrap_or_else(|| v["id"].to_string()));
+                    raw.push(line.to_string());
+                }
+                Ok(v) => bad.push((v["id"].as_str().map(str::to_string).unwrap_or(format!("line {}", k + 1)), "text_late row needs \"text\" and \"spans\"".into())),
+                Err(e) => bad.push((format!("line {}", k + 1), format!("bad JSON: {e}"))),
+            }
+            continue;
+        }
         match serde_json::from_str::<serde_json::Value>(line) {
             Ok(v) => match v[key].as_str() {
                 Some(x) => {
@@ -313,7 +454,7 @@ fn peak_rss_mb() -> f64 {
 /// Processing order: longest first (sentence-transformers sorts by text length; images by pixel count).
 fn item_order(a: &Args, raw: &[String], dir: &Path) -> Vec<usize> {
     let mut order: Vec<usize> = (0..raw.len()).collect();
-    if a.modality == Modality::Text {
+    if matches!(a.modality, Modality::Text | Modality::TextLate) {
         order.sort_by_key(|&i| std::cmp::Reverse(raw[i].chars().count()));
     } else {
         let px: Vec<usize> = raw
@@ -345,22 +486,37 @@ struct Acc {
     nb: usize,
     /// serve: (item index, error) for items that were skipped
     failed: Vec<(usize, String)>,
+    /// text_late: per document, per span: vector + metadata (filled as windows come back)
+    spans: Vec<Vec<Option<(Vec<f32>, SpanMeta)>>>,
 }
 
 impl Acc {
     fn new(n: usize, want_late: bool) -> Acc {
-        Acc { dense: vec![vec![]; n], late: vec![vec![]; if want_late { n } else { 0 }], want_late, ntok: 0, gpu_s: 0.0, nb: 0, failed: vec![] }
+        Acc { dense: vec![vec![]; n], late: vec![vec![]; if want_late { n } else { 0 }], want_late, ntok: 0, gpu_s: 0.0, nb: 0, failed: vec![], spans: vec![vec![]; n] }
     }
     fn items(b: &Batch) -> &[usize] {
         match b {
-            Batch::Text { items, .. } | Batch::NeoImage { items, .. } | Batch::GemmaImage { items, .. } | Batch::Audio { items, .. } => items,
+            Batch::Text { items, .. } | Batch::NeoImage { items, .. } | Batch::GemmaImage { items, .. } | Batch::Audio { items, .. } | Batch::Late { items, .. } => items,
         }
     }
     fn add(&mut self, b: &Batch, res: (Vec<f32>, Vec<f32>), dt: f64) {
         self.gpu_s += dt;
         self.nb += 1;
+        if let Batch::Late { ids, refs, meta, .. } = b {
+            self.ntok += ids.len();
+            let od = res.0.len() / refs.len().max(1);
+            for (k, (&(it, si), m)) in refs.iter().zip(meta).enumerate() {
+                let sp = &mut self.spans[it];
+                if sp.len() <= si {
+                    sp.resize(si + 1, None);
+                }
+                sp[si] = Some((res.0[k * od..(k + 1) * od].to_vec(), m.clone()));
+            }
+            return;
+        }
         let (items, ids, cu) = match b {
             Batch::Text { items, ids, cu } | Batch::NeoImage { items, ids, cu, .. } | Batch::GemmaImage { items, ids, cu, .. } | Batch::Audio { items, ids, cu, .. } => (items, ids, cu),
+            Batch::Late { .. } => unreachable!(),
         };
         self.ntok += ids.len();
         let od = res.0.len() / items.len();
@@ -378,6 +534,35 @@ impl Acc {
 /// Writes <tag>.dense.npy / .ids.json (/ NeoMME late files) and <tag>.json; returns the stats row.
 #[allow(clippy::too_many_arguments)]
 fn write_outputs(a: &Args, eng: &Engine, mut acc: Acc, ids_all: &[String], wall: f64, load_s: f64, total_s: f64, mem_loaded: &gpu::MemInfo) -> Result<serde_json::Value> {
+    // text_late: one row per span, documents in input order, spans in row order; a document is written when all of
+    // its spans came back (failed documents are reported by the caller)
+    let late_rows: Vec<String>;
+    let mut span_info = vec![];
+    let ids_all: &[String] = if a.modality == Modality::TextLate {
+        let failed: std::collections::HashSet<usize> = acc.failed.iter().map(|f| f.0).collect();
+        let (mut vecs, mut sids) = (vec![], vec![]);
+        for (i, sp) in acc.spans.iter().enumerate() {
+            if failed.contains(&i) || sp.is_empty() {
+                continue;
+            }
+            let of = sp.iter().flatten().next().map_or(0, |x| x.1.of);
+            if sp.len() != of || sp.iter().any(Option::is_none) {
+                bail!("document {}: {} of {of} spans embedded", ids_all[i], sp.iter().flatten().count());
+            }
+            for (v, m) in sp.iter().flatten() {
+                vecs.push(v.clone());
+                sids.push(m.id.clone());
+                span_info.push(json!({"id": m.id, "doc": ids_all[i], "window": m.window, "windows": m.windows,
+                    "tokens": m.tokens, "clipped": m.clipped, "widened": m.widened}));
+            }
+        }
+        acc.dense = vecs;
+        acc.want_late = false;
+        late_rows = sids;
+        &late_rows
+    } else {
+        ids_all
+    };
     // items without a vector (serve: failed items) are left out of every output file
     let keep: Vec<usize> = (0..ids_all.len()).filter(|&i| !acc.dense[i].is_empty()).collect();
     if keep.len() < ids_all.len() {
@@ -414,6 +599,9 @@ fn write_outputs(a: &Args, eng: &Engine, mut acc: Acc, ids_all: &[String], wall:
         ndarray_npy::write_npy(a.out_dir().join(format!("{}.late_offsets.npy", a.tag)), &Array1::from_vec(offs))?;
     }
     std::fs::write(a.out_dir().join(format!("{}.ids.json", a.tag)), serde_json::to_string(ids_out)?)?;
+    if a.modality == Modality::TextLate {
+        std::fs::write(a.out_dir().join(format!("{}.spans.json", a.tag)), serde_json::to_string(&span_info)?)?;
+    }
     let max_len = a.max_len.unwrap_or(match a.model { Model::Gemma => 8192, Model::Neomme => 16384 });
     let res = json!({
         "runtime": "flashembed-gpu", "model": format!("{:?}", a.model).to_lowercase(), "modality": format!("{:?}", a.modality).to_lowercase(),
@@ -691,7 +879,11 @@ fn serve(sa: ServeArgs) -> Result<()> {
                         _ => err,
                     };
                     let failed = fail_json(&ids, &acc, &bad);
-                    let nok = acc.dense.iter().filter(|v| !v.is_empty()).count();
+                    let nok = if a.modality == Modality::TextLate {
+                        acc.spans.iter().flatten().flatten().count()
+                    } else {
+                        acc.dense.iter().filter(|v| !v.is_empty()).count()
+                    };
                     let secs = t0.elapsed().as_secs_f64();
                     if let Some(e) = err {
                         reply(json!({"id": id, "ok": false, "error": e, "seconds": secs, "failed": failed}));
@@ -729,7 +921,7 @@ fn prep_only(a: &Args, ctx: &Ctx, raw: &[String], dir: &Path, query: bool) -> Re
         });
         for b in rx {
             match b? {
-                Batch::Text { ids, .. } | Batch::NeoImage { ids, .. } | Batch::GemmaImage { ids, .. } | Batch::Audio { ids, .. } => ntok += ids.len(),
+                Batch::Text { ids, .. } | Batch::NeoImage { ids, .. } | Batch::GemmaImage { ids, .. } | Batch::Audio { ids, .. } | Batch::Late { ids, .. } => ntok += ids.len(),
             }
             nb += 1;
         }
@@ -758,6 +950,7 @@ fn execute(eng: &mut Engine, b: &Batch, late: bool) -> Result<(Vec<f32>, Vec<f32
             Ok((eng.gemma_text(ids, cu, Some(mm))?, vec![]))
         }
         Batch::NeoImage { ids, cu, pos, patches, rows, .. } => eng.neomme(ids, cu, Some(pos), patches, rows, late),
+        Batch::Late { ids, cu, lo, hi, .. } => Ok((eng.gemma_text_spans(ids, cu, lo, hi)?, vec![])),
         Batch::Audio { cu0, feats, m0, rows1, m1, rows2, m2, soft_rows, ids, cu, mm, .. } => {
             eng.gemma_audio(cu0, feats, m0, rows1, m1, rows2, m2, soft_rows)?;
             Ok((eng.gemma_text(ids, cu, Some(mm))?, vec![]))
@@ -810,6 +1003,54 @@ fn produce(a: &Args, ctx: &Ctx, raw: &[String], order: &[usize], dir: &Path, que
             }
             if !cur.2.is_empty() {
                 send(Batch::Text { ids: cur.0, cu: cur.1, items: cur.2 })?;
+            }
+        }
+        Modality::TextLate => {
+            if a.model != Model::Gemma {
+                bail!("text_late is EmbeddingGemma 2 only");
+            }
+            let wmax = a.max_len.unwrap_or(8192).min(max_tokens_of(a));
+            let empty = || Batch::Late { ids: vec![], cu: vec![0], lo: vec![], hi: vec![], refs: vec![], meta: vec![], items: vec![] };
+            let mut cur = empty();
+            for chunk in order.chunks(64) {
+                let docs: Vec<Result<LateDoc>> = chunk.par_iter().map(|&i| late_doc(&ctx.tok, &raw[i], wmax, a.late_overlap)).collect();
+                for (&i, d) in chunk.iter().zip(docs) {
+                    let d = match d {
+                        Ok(d) => d,
+                        Err(e) => {
+                            fail(i, format!("{e:#}"))?;
+                            continue;
+                        }
+                    };
+                    for (w, win) in d.windows.iter().enumerate() {
+                        // windows without spans are not run
+                        if !d.spans.iter().any(|sp| sp.0 == w) {
+                            continue;
+                        }
+                        let Batch::Late { ids, cu, items, .. } = &cur else { unreachable!() };
+                        if !items.is_empty() && (ids.len() + win.len() > max_tokens_of(a) || cu.len() > a.max_items) {
+                            send(std::mem::replace(&mut cur, empty()))?;
+                        }
+                        let Batch::Late { ids, cu, lo, hi, refs, meta, items } = &mut cur else { unreachable!() };
+                        let base = ids.len();
+                        ids.extend_from_slice(win);
+                        cu.push(ids.len() as i32);
+                        if items.last() != Some(&i) {
+                            items.push(i);
+                        }
+                        for (si, sp) in d.spans.iter().enumerate().filter(|(_, sp)| sp.0 == w) {
+                            lo.push((base + sp.1) as i32);
+                            hi.push((base + sp.2) as i32);
+                            refs.push((i, si));
+                            meta.push(sp.3.clone());
+                        }
+                    }
+                }
+            }
+            if let Batch::Late { items, .. } = &cur {
+                if !items.is_empty() {
+                    send(cur)?;
+                }
             }
         }
         Modality::Audio => {

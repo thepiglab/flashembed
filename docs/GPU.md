@@ -249,6 +249,51 @@ benchmark videos (32 unique ids). The CPU runner's `embed --dim` ran on a subset
 - Slicing the 768-d output to d and re-normalising gives the `--dim d` vector to within 2.3e-7 (max abs difference).
 - `--dim` is validated on GPU and CPU.
 
+### Late chunking (`--modality text_late`, EmbeddingGemma 2)
+
+One bidirectional pass over a whole document, then one vector per character span. Each span takes the mean of the
+final hidden states of its tokens, without the prompt prefix or special tokens. The model's projection and L2
+normalisation follow, exactly where sentence-transformers applies them after `Pooling(mean)`.
+
+Input rows:
+
+```json
+{"id": "doc", "text": "title: none | text: ...", "prefix_chars": 20, "spans": [{"id": "u1", "start": 20, "end": 812}, ...]}
+```
+
+Character offsets are into `text`, and spans may overlap. The output is one row per span, in input order: `ids.json`
+holds the span ids, and `<tag>.spans.json` gives each span's document, window, token count and the flags below.
+`embed` and `serve` both take it (`--modalities text,text_late`).
+
+- **Span tokens:** a span covers the document tokens whose first character lies inside `[start, end)`. If no token
+  starts inside it, the span takes the token containing `start` (`widened`).
+- **Long documents:** a document longer than `--max-len` (default 8,192 tokens) is split into windows of
+  `[bos + prefix tokens] + body slice + [eos]`. Consecutive slices overlap by `--late-overlap` tokens (default 1,024).
+- **Window choice:** each span is pooled in the window that holds it with the largest margin to the slice edges. A
+  span longer than any window is clipped to the window overlapping it most (`clipped`). Windows without spans are
+  skipped.
+
+Validation used 300 real PubMed Central articles (median 33k characters, up to 427k) and 8,937 spans: one per text
+unit, plus a 2-character span per article and a whole-document span on 20 of them. The reference is
+`py/late_ref.py`: sentence-transformers' transformer module, the same layout, span mean, then its Dense, Dense and
+Normalize modules, all in fp32.
+
+| case | n | fp32 min cos | bf16 min / p01 / median cos |
+|---|---|---|---|
+| all spans | 8,937 | 0.99999999 | 0.9834 / 0.99975 / 0.99999 |
+| spans in documents with more than one window | 6,364 | 0.99999999 | 0.9834 / - / 0.99999 |
+| 2-character spans | 300 | 1.0000000 | 0.9989 / - / 0.99997 |
+| whole-document spans | 20 | 1.0000000 | 0.99999 / - / 1.00000 |
+
+- Every span uses the same window and token count as the reference.
+- `serve` returns the same vectors as `embed`, bit for bit.
+- 19 of 8,937 bf16 spans are below 0.999, mostly in documents longer than 8k tokens.
+- A whole-document span is close to normal `embed` of the same text (median cos 0.9999, min 0.996). It is not equal:
+  `embed` also averages the prompt and special tokens, and truncates at `--max-len`.
+
+Throughput on one B200 (8 CPUs, 3.7M tokens): bf16 974 spans/s, 33 documents/s, 403k tokens/s. fp32 runs at 129
+spans/s.
+
 ### Persistent mode (`serve`)
 
 `flashembed-gpu serve` loads the model once and then takes one request per stdin line, for corpus runs that
