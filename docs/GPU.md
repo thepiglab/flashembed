@@ -225,6 +225,30 @@ Adding video and audio does not change text or images: their vectors are bit-ide
 alternating runs on the same inputs give the same speed within noise (text 1,944 vs 1,951 items/s, images 246 vs
 243 items/s, at 1 CPU core).
 
+### Matryoshka `--dim` parity (EmbeddingGemma 2)
+
+`--dim 512|256|128` keeps the leading dimensions of the 768-d vector and re-normalises it, as sentence-transformers'
+`truncate_dim` does. The reference is sentence-transformers fp32 `encode(..., truncate_dim=d,
+normalize_embeddings=True)` on the same GPU (`slurm/gpu-mrl.sbatch`, report `py/dim_report.py`; B200, job of
+2026-11-15). The inputs are 1,000 PubMed Central text chunks (document prompt, 1,024 tokens), 200 figures and 34
+benchmark videos (32 unique ids). The CPU runner's `embed --dim` ran on a subset (200 / 50 / 8).
+
+| modality | dim | flashembed-gpu fp32 min cos | flashembed-gpu bf16 min / median cos | CPU runner fp32 min cos |
+|---|---|---|---|---|
+| text | 512 | 1.0000000 | 0.99994 / 0.99999 | 1.0000000 |
+| text | 256 | 1.0000000 | 0.99995 / 0.99999 | 1.0000000 |
+| text | 128 | 1.0000000 | 0.99996 / 1.00000 | 1.0000000 |
+| figures | 512 | 1.0000000 | 0.99946 / 0.99998 | 1.0000000 |
+| figures | 256 | 1.0000000 | 0.99952 / 0.99998 | 1.0000000 |
+| figures | 128 | 1.0000000 | 0.99970 / 0.99998 | 1.0000000 |
+| video | 512 | 1.0000000 | 0.99989 / 0.99998 | 1.0000000 |
+| video | 256 | 1.0000000 | 0.99990 / 0.99999 | 1.0000000 |
+| video | 128 | 1.0000000 | 0.99994 / 0.99999 | 1.0000000 |
+
+- `serve --dim d` returns the same vectors as `embed --dim d`, bit for bit, in both precisions.
+- Slicing the 768-d output to d and re-normalising gives the `--dim d` vector to within 2.3e-7 (max abs difference).
+- `--dim` is validated on GPU and CPU.
+
 ### Persistent mode (`serve`)
 
 `flashembed-gpu serve` loads the model once and then takes one request per stdin line, for corpus runs that
