@@ -138,6 +138,9 @@ pub fn audio_soft_tokens(mask: &[bool]) -> usize {
 // ------------------------------------------------------------------------------------------------- video
 pub struct VideoMeta {
     pub total_frames: usize,
+    /// presentation timestamps (stream time base) of the frames found by the packet scan, sorted: frame index i of
+    /// torchcodec's exact mode is the frame with the i-th smallest timestamp (empty: header fallback)
+    pub frame_pts: Vec<i64>,
     pub fps: f64,
     /// Stream duration in seconds.
     pub duration: f64,
@@ -175,7 +178,7 @@ pub fn decode_image_ffmpeg(path: &Path) -> Result<RgbImage> {
 pub fn probe_video(path: &Path) -> Result<VideoMeta> {
     let out = Command::new(ffprobe_bin())
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
-        .arg("stream=nb_frames,avg_frame_rate,width,height,time_base:packet=pts,duration,flags")
+        .arg("stream=nb_frames,avg_frame_rate,width,height,time_base:packet=pts,dts,duration,flags")
         .args(["-of", "json"])
         .arg(path)
         .output()
@@ -188,25 +191,33 @@ pub fn probe_video(path: &Path) -> Result<VideoMeta> {
         let (a, b) = x.split_once('/').unwrap_or((x, "1"));
         a.parse::<f64>().unwrap_or(0.0) / b.parse::<f64>().unwrap_or(1.0)
     };
-    let tb = ratio(s["time_base"].as_str().unwrap_or("0/1"));
-    let (mut n, mut lo, mut hi) = (0usize, i64::MAX, i64::MIN);
+    // torchcodec's scan: per packet pts, or dts when the container gives no pts (AVI), discarded packets skipped;
+    // seconds = ts * num / den (in that order: num/den first changes the last bits, and with them sampled indices)
+    let (tn, td) = s["time_base"].as_str().and_then(|x| x.split_once('/')).map_or((0i64, 1i64), |(a, b)| {
+        (a.parse().unwrap_or(0), b.parse().unwrap_or(1))
+    });
+    let secs = |x: i64| -> f64 { x as f64 * tn as f64 / td as f64 };
+    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+    let mut pts = Vec::new();
     for p in v["packets"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
-        let Some(pts) = p["pts"].as_i64() else { continue };
+        let Some(ts) = p["pts"].as_i64().or_else(|| p["dts"].as_i64()) else { continue };
         if p["flags"].as_str().is_some_and(|f| f.as_bytes().get(1) == Some(&b'D')) {
             continue;
         }
-        n += 1;
-        lo = lo.min(pts);
-        hi = hi.max(pts + p["duration"].as_i64().unwrap_or(0));
+        pts.push(ts);
+        lo = lo.min(ts);
+        hi = hi.max(ts + p["duration"].as_i64().unwrap_or(0));
     }
-    if n > 0 && tb > 0.0 && hi > lo {
-        let (b, e) = (lo as f64 * tb, hi as f64 * tb);
-        return Ok(VideoMeta { total_frames: n, fps: n as f64 / (e - b), duration: e - b, width, height });
+    let n = pts.len();
+    if n > 0 && tn > 0 && hi > lo {
+        pts.sort_unstable();
+        let d = secs(hi) - secs(lo);
+        return Ok(VideoMeta { total_frames: n, frame_pts: pts, fps: n as f64 / d, duration: d, width, height });
     }
     let total = s["nb_frames"].as_str().and_then(|x| x.parse().ok()).unwrap_or(0usize);
     let fps = ratio(s["avg_frame_rate"].as_str().unwrap_or("0/1"));
     let duration = if fps > 0.0 { total as f64 / fps } else { 0.0 };
-    Ok(VideoMeta { total_frames: total, fps, duration, width, height })
+    Ok(VideoMeta { total_frames: total, frame_pts: vec![], fps, duration, width, height })
 }
 
 /// EmbeddingGemma2VideoProcessor.sample_frames (fps=1, max_frames=32, overflow "uniform").
@@ -225,35 +236,82 @@ pub fn sample_indices(m: &VideoMeta, fps: f64, max_frames: usize) -> Vec<usize> 
     idx
 }
 
-/// Decode the selected frames (decode order, like PyAV's container.decode) as RGB24, bilinear swscale.
+/// Decode the selected frames as RGB24 (bilinear swscale). Frames are picked by presentation timestamp, as
+/// torchcodec's exact seek mode does (frame i = i-th smallest pts of the scan), with an ffmpeg `select` filter; if
+/// that yields a different number of frames (e.g. frames the decoder never outputs), fall back to taking the i-th
+/// output frame in order.
 pub fn decode_frames(path: &Path, m: &VideoMeta, indices: &[usize]) -> Result<Vec<RgbImage>> {
-    let mut child = Command::new(ffmpeg_bin())
-        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
-        .arg(path)
-        .args(["-map", "0:v:0", "-fps_mode", "passthrough", "-sws_flags", "bilinear", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("running ffmpeg")?;
-    let mut so = child.stdout.take().unwrap();
-    let fsz = (m.width * m.height * 3) as usize;
-    let last = *indices.iter().max().unwrap_or(&0);
-    let mut buf = vec![0u8; fsz];
-    let mut frames = Vec::with_capacity(indices.len());
-    let mut i = 0usize;
-    while i <= last {
-        if so.read_exact(&mut buf).is_err() {
-            break;
+    if !m.frame_pts.is_empty() {
+        // torchcodec exact mode: frame i is the first decoded frame with pts >= the i-th smallest packet pts. Keep
+        // container timestamps (-copyts) and select, per wanted pts t, the first frame with prev_selected < t <= pts;
+        // showinfo reports the pts of each selected frame so frames the decoder never emits map to the next one.
+        let mut want: Vec<i64> = indices.iter().map(|&i| m.frame_pts[i.min(m.frame_pts.len() - 1)]).collect();
+        want.sort_unstable();
+        want.dedup();
+        let prev = "if(isnan(prev_selected_pts),-1e18,prev_selected_pts)";
+        let expr = want.iter().map(|t| format!("gte(pts,{t})*lt({prev},{t})")).collect::<Vec<_>>().join("+");
+        let (got, pts) = run_ffmpeg_frames(path, m, Some(&format!("select='{expr}',showinfo")), want.len())?;
+        if !got.is_empty() && pts.len() >= got.len() {
+            let pick = |t: i64| pts[..got.len()].iter().position(|&p| p >= t);
+            if want.iter().all(|&t| pick(t).is_some()) {
+                return Ok(indices
+                    .iter()
+                    .map(|&i| got[pick(m.frame_pts[i.min(m.frame_pts.len() - 1)]).unwrap()].clone())
+                    .collect());
+            }
         }
-        for _ in indices.iter().filter(|&&k| k == i) {
-            frames.push(RgbImage::from_raw(m.width, m.height, buf.clone()).unwrap());
-        }
-        i += 1;
     }
-    drop(so);
-    let _ = child.kill();
-    let _ = child.wait();
+    let last = *indices.iter().max().unwrap_or(&0);
+    let (all, _) = run_ffmpeg_frames(path, m, None, last + 1)?;
+    let frames: Vec<RgbImage> = indices.iter().filter(|&&k| k < all.len()).map(|&k| all[k].clone()).collect();
     if frames.is_empty() {
         bail!("no frames decoded from {}", path.display());
     }
     Ok(frames)
+}
+
+/// Up to `max` RGB24 frames of the first video stream, optionally through a video filter (timestamps kept as in the
+/// container); with a showinfo filter, also the pts of each output frame.
+fn run_ffmpeg_frames(path: &Path, m: &VideoMeta, vf: Option<&str>, max: usize) -> Result<(Vec<RgbImage>, Vec<i64>)> {
+    let mut cmd = Command::new(ffmpeg_bin());
+    let info = vf.is_some_and(|f| f.contains("showinfo"));
+    cmd.args(["-nostdin", "-hide_banner", "-loglevel", if info { "info" } else { "error" }, "-copyts", "-i"])
+        .arg(path)
+        .args(["-map", "0:v:0"]);
+    if let Some(f) = vf {
+        cmd.args(["-vf", f]);
+    }
+    let mut child = cmd
+        .args(["-fps_mode", "passthrough", "-sws_flags", "bilinear", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .stdout(Stdio::piped())
+        .stderr(if info { Stdio::piped() } else { Stdio::inherit() })
+        .spawn()
+        .context("running ffmpeg")?;
+    let err = child.stderr.take().map(|e| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::BufReader::new(e).read_to_string(&mut s);
+            s.lines()
+                .filter(|l| l.contains("showinfo") && l.contains(" n:"))
+                .filter_map(|l| l.split("pts:").nth(1)?.split_whitespace().next()?.parse::<i64>().ok())
+                .collect::<Vec<i64>>()
+        })
+    });
+    let mut so = child.stdout.take().unwrap();
+    let fsz = (m.width * m.height * 3) as usize;
+    let mut frames = Vec::new();
+    let mut buf = vec![0u8; fsz];
+    while frames.len() < max {
+        if so.read_exact(&mut buf).is_err() {
+            break;
+        }
+        frames.push(RgbImage::from_raw(m.width, m.height, buf.clone()).unwrap());
+    }
+    drop(so);
+    if !info {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let pts = err.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+    Ok((frames, pts))
 }

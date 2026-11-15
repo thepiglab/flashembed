@@ -23,6 +23,10 @@ unsafe extern "C" {
         desc: *const i32, coef: *const i32, ncoef: u64, max_pix: c_int, nslot: c_int, slot_ptr: *const i32,
         slot_patch: *const i32,
     ) -> c_int;
+    fn fe_gemma_audio(
+        h: *mut c_void, nclip: c_int, cu0: *const i32, feats: *const f32, m0: *const i32, n1: c_int, rows1: *const i32,
+        m1: *const i32, n2: c_int, rows2: *const i32, m2: *const i32, nsoft: c_int, soft_rows: *const i32,
+    ) -> c_int;
     fn fe_neomme(
         h: *mut c_void, ntok: c_int, nseq: c_int, ids: *const i32, cu: *const i32, pos2: *const i32, npatch: c_int,
         patches: *const u8, patch_rows: *const i32, dense: *mut f32, late: *mut f32,
@@ -30,6 +34,9 @@ unsafe extern "C" {
     fn fe_mem(h: *mut c_void, out: *mut u64) -> c_int;
     fn fe_device_name(buf: *mut c_char, n: c_int) -> c_int;
     fn fe_smem_optin() -> c_int;
+    fn fe_attn_bench(
+        dtype: c_int, d: c_int, hq: c_int, hkv: c_int, s: c_int, nseq: c_int, window: c_int, iters: c_int, ms: *mut f32,
+    ) -> c_int;
     fn fe_free(h: *mut c_void);
 }
 
@@ -78,6 +85,14 @@ pub struct MemInfo {
 }
 
 /// Opt-in shared memory per block (bytes) of the current GPU.
+/// Attention kernel alone: `nseq` packed sequences of `s` tokens (window < 0: full), mean ms per call.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_bench(fp32: bool, d: i32, hq: i32, hkv: i32, s: i32, nseq: i32, window: i32, iters: i32) -> Result<f32> {
+    let mut ms = 0f32;
+    ck(unsafe { fe_attn_bench(if fp32 { 0 } else { 1 }, d, hq, hkv, s, nseq, window, iters, &mut ms) })?;
+    Ok(ms)
+}
+
 pub fn smem_optin() -> usize {
     unsafe { fe_smem_optin() }.max(0) as usize
 }
@@ -113,9 +128,10 @@ fn for_tensors(path: &Path, keep: &dyn Fn(&str) -> bool, f: &mut dyn FnMut(&str,
 impl Engine {
     /// Load a model from its HF snapshot. `vision`: also build EmbeddingGemma 2's vision tower.
     /// `img_bytes` > 0: GPU image preprocessing (EmbeddingGemma 2) with this many bytes of decoded images per batch.
-    /// `quant`: 0 = off, 1 = MXFP8, 2 = NVFP4 for the layer GEMMs (bf16 only).
+    /// `quant`: 0 = off, 1 = MXFP8, 2 = NVFP4 for the layer GEMMs (bf16 only). `audio_frames` > 0: also build
+    /// EmbeddingGemma 2's audio tower, with that many log-mel frames per forward.
     #[allow(clippy::too_many_arguments)]
-    pub fn load(snapshot: &Path, arch: Arch, dtype: Dtype, vision: bool, max_tokens: usize, max_patches: usize, img_bytes: usize, quant: u32) -> Result<Self> {
+    pub fn load(snapshot: &Path, arch: Arch, dtype: Dtype, vision: bool, max_tokens: usize, max_patches: usize, img_bytes: usize, quant: u32, audio_frames: usize) -> Result<Self> {
         let cfg: Value = serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json"))?)?;
         let h = unsafe {
             fe_new(match arch { Arch::Gemma => 0, Arch::Neomme => 1 }, match dtype { Dtype::F32 => 0, Dtype::Bf16 => 1 }, 0)
@@ -146,6 +162,21 @@ impl Engine {
                     set(&format!("full.{i}"), if lt.as_str() == Some("full_attention") { 1.0 } else { 0.0 })?;
                 }
                 e.out_dim = num(t, "embedding_dim")? as usize;
+                if audio_frames > 0 {
+                    let a = &cfg["audio_config"];
+                    set("audio", 1.0)?;
+                    set("max_frames", audio_frames as f64)?;
+                    for (k, j) in [("a_hidden", "hidden_size"), ("a_heads", "num_attention_heads"), ("a_layers", "num_hidden_layers"),
+                        ("a_chunk", "attention_chunk_size"), ("a_left", "attention_context_left"), ("a_right", "attention_context_right"),
+                        ("a_kernel", "conv_kernel_size"), ("a_softcap", "attention_logit_cap"), ("a_invalid", "attention_invalid_logits_value"),
+                        ("a_resw", "residual_weight"), ("a_eps", "rms_norm_eps")]
+                    {
+                        set(k, num(a, j)?)?;
+                    }
+                    if a["subsampling_conv_channels"] != serde_json::json!([128, 32]) || a["hidden_act"].as_str() != Some("silu") {
+                        bail!("unsupported Gemma 4 audio config");
+                    }
+                }
                 if vision {
                     let v = &cfg["vision_config"];
                     set("vision", 1.0)?;
@@ -199,7 +230,9 @@ impl Engine {
         }
         let keep = |n: &str| match arch {
             Arch::Gemma => {
-                n.starts_with("language_model.") || (vision && (n.starts_with("vision_tower.") || n.starts_with("embed_vision.")))
+                n.starts_with("language_model.")
+                    || (vision && (n.starts_with("vision_tower.") || n.starts_with("embed_vision.")))
+                    || (audio_frames > 0 && (n.starts_with("audio_tower.") || n.starts_with("embed_audio.")))
             }
             Arch::Neomme => true,
         };
@@ -245,6 +278,17 @@ impl Engine {
                 self.h, npatch as c_int, (vcu.len() - 1) as c_int, vcu.as_ptr(), pos.as_ptr(), src.as_ptr(), src.len() as u64,
                 desc.as_ptr(), coef.as_ptr(), coef.len() as u64, max_pix as c_int, (slot_ptr.len() - 1) as c_int,
                 slot_ptr.as_ptr(), slot_patch.as_ptr(),
+            )
+        })
+    }
+
+    /// Gemma 4 audio tower on packed clips (see cuda/fegpu.cu fe_gemma_audio); leaves soft tokens for gemma_text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemma_audio(&mut self, cu0: &[i32], feats: &[f32], m0: &[i32], rows1: &[i32], m1: &[i32], rows2: &[i32], m2: &[i32], soft_rows: &[i32]) -> Result<()> {
+        ck(unsafe {
+            fe_gemma_audio(
+                self.h, (cu0.len() - 1) as c_int, cu0.as_ptr(), feats.as_ptr(), m0.as_ptr(), m1.len() as c_int, rows1.as_ptr(),
+                m1.as_ptr(), m2.len() as c_int, rows2.as_ptr(), m2.as_ptr(), soft_rows.len() as c_int, soft_rows.as_ptr(),
             )
         })
     }

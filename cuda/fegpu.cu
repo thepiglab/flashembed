@@ -52,6 +52,26 @@ struct FeErr : std::runtime_error {
   } while (0)
 
 enum { DT_F32 = 0, DT_BF16 = 1 };
+
+// optional cuDNN fused attention (cuda/fe_cudnn.cu; a stub unless built with FLASHEMBED_CUDNN_INCLUDE)
+extern "C" {
+const char* fecd_error();
+void* fecd_new(void* stream);
+int fecd_attn(void* ctx, int nb, int smax, int Hq, int Hkv, int D, int window, float scale, const void* q, const void* k,
+              const void* v, void* o, int ld, int ld_out, const int* rag, const int* rago, const int* sl);
+int fecd_graphs(void* ctx);
+size_t fecd_bytes(void* ctx);
+void fecd_free(void* ctx);
+}
+__global__ void k_cd_meta(const int* cu, int n, int nb, int ld, int ld_out, int* rag, int* rago, int* sl) {
+  const int b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b > nb) return;
+  const int c = cu[b < n ? b : n];
+  rag[b] = c * ld;
+  rago[b] = c * ld_out;
+  if (b < nb) sl[b] = b < n ? cu[b + 1] - cu[b] : 0;
+}
+
 enum { ARCH_GEMMA = 0, ARCH_NEOMME = 1 };
 
 // ------------------------------------------------------------------------------------------------- device helpers
@@ -104,6 +124,7 @@ __global__ void k_bf16_to_f32(const bf16* a, float* b, size_t n) {
 
 // Residual / norm step for one token row (block per row, n = hidden size):
 //   x_mode 1: h += rms(x) * w_post      x_mode 2: h += xmul * x      x_mode 3: h = x
+//   x_mode 4: h += xmul * rms(x) * w_post (Gemma 4 audio feed-forward, residual weight 0.5)
 //   h *= hscale
 //   z = init ? la * h + lb * init : h
 //   y_mode 1: y = rms(z) * (w_pre or 1)  y_mode 2: y = z      (y written as T, and/or y32 as float)
@@ -126,10 +147,11 @@ __global__ void k_resid_norm(int n, float eps, const T* __restrict__ x, int x_mo
       ss += xv[k] * xv[k];
     }
     float r = 1.f;
-    if (x_mode == 1) r = 1.f / sqrtf(block_sum(ss) / n + eps);
+    if (x_mode == 1 || x_mode == 4) r = 1.f / sqrtf(block_sum(ss) / n + eps);
     k = 0;
     for (int c = threadIdx.x; c < n; c += blockDim.x, ++k) {
       if (x_mode == 1) v[k] += xv[k] * r * w_post[c];
+      else if (x_mode == 4) v[k] += xmul * (xv[k] * r * w_post[c]);
       else if (x_mode == 2) v[k] += xmul * xv[k];
       else v[k] = xv[k];
     }
@@ -270,15 +292,16 @@ __global__ void __launch_bounds__(256) k_resid_norm_w(int ntok, int n, float eps
 #pragma unroll
       for (int j = 0; j < 4; ++j) ss += xv[i][j] * xv[i][j];
     }
-    const float r = x_mode == 1 ? 1.f / sqrtf(warp_sum(ss) / n + eps) : 1.f;
+    const float r = (x_mode == 1 || x_mode == 4) ? 1.f / sqrtf(warp_sum(ss) / n + eps) : 1.f;
 #pragma unroll
     for (int i = 0; i < NV; ++i) {
       const int c = (lane + 32 * i) * 4;
       float w[4] = {1.f, 1.f, 1.f, 1.f};
-      if (x_mode == 1) ld4(w_post + c, w);
+      if (x_mode == 1 || x_mode == 4) ld4(w_post + c, w);
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         if (x_mode == 1) v[i][j] += xv[i][j] * r * w[j];
+        else if (x_mode == 4) v[i][j] += xmul * (xv[i][j] * r * w[j]);
         else if (x_mode == 2) v[i][j] += xmul * xv[i][j];
         else v[i][j] = xv[i][j];
       }
@@ -373,6 +396,172 @@ __global__ void __launch_bounds__(256) k_ple_w(const T* __restrict__ g, const T*
     for (int j = 0; j < 4; ++j) o[j] = gelu_tanh(gv[j]) * v[i][j] * r * wv[j];
     st4(z + row * n + c, o);
   }
+}
+
+// ---- Gemma 4 audio tower (EmbeddingGemma 2 audio), on packed clips. Row-map arrays give, for every packed row of a
+// stage, the packed start of its clip in the previous stage, that clip's length there and the row's local index.
+// Subsampling conv 0: features [T0, 128] (time x mel) -> [T1, 64, 128] (channels last), 3x3 stride 2 pad 1, input
+// frames multiplied by the frame mask, then LayerNorm over the 128 channels (no bias) + ReLU (CPU op ChannelLayerNorm)
+__global__ void k_aconv0(const float* __restrict__ feats, const int* __restrict__ m0, const int* __restrict__ rows1,
+                         const float* __restrict__ w, const float* __restrict__ nw, float eps, float* __restrict__ out) {
+  const int r = blockIdx.x, f = blockIdx.y, c = threadIdx.x;  // 128 threads = channels
+  const int base0 = rows1[3 * r], len0 = rows1[3 * r + 1], lt = rows1[3 * r + 2];
+  float acc = 0.f;
+#pragma unroll
+  for (int dt = 0; dt < 3; ++dt) {
+    const int t = 2 * lt - 1 + dt;
+    if (t < 0 || t >= len0 || !m0[base0 + t]) continue;
+#pragma unroll
+    for (int df = 0; df < 3; ++df) {
+      const int ff = 2 * f - 1 + df;
+      if (ff < 0 || ff >= 128) continue;
+      acc += w[c * 9 + dt * 3 + df] * feats[(size_t)(base0 + t) * 128 + ff];
+    }
+  }
+  const float mean = block_sum(acc) / 128.f;
+  const float d = acc - mean;
+  const float var = block_sum(d * d) / 128.f;
+  out[((size_t)r * 64 + f) * 128 + c] = fmaxf(d / sqrtf(var + eps) * nw[c], 0.f);
+}
+// Subsampling conv 1: [T1, 64, 128] -> [T2, 32 (freq), 32 (ch)] flattened to 1024 (= HF permute(0, 2, 3, 1)), in T
+template <typename T>
+__global__ void k_aconv1(const float* __restrict__ in, const int* __restrict__ m1, const int* __restrict__ rows2,
+                         const float* __restrict__ w, const float* __restrict__ nw, float eps, T* __restrict__ out) {
+  __shared__ float x[9][128];
+  const int r = blockIdx.x, f = blockIdx.y, c = threadIdx.x;  // 32 threads = output channels
+  const int base1 = rows2[5 * r], len1 = rows2[5 * r + 1], lt = rows2[5 * r + 2];
+  for (int i = c; i < 9 * 128; i += 32) {
+    const int tap = i / 128, ci = i % 128, t = 2 * lt - 1 + tap / 3, ff = 2 * f - 1 + tap % 3;
+    const bool ok = t >= 0 && t < len1 && ff >= 0 && ff < 64 && m1[base1 + t];
+    x[tap][ci] = ok ? in[((size_t)(base1 + t) * 64 + ff) * 128 + ci] : 0.f;
+  }
+  __syncthreads();
+  float acc = 0.f;
+  for (int ci = 0; ci < 128; ++ci)
+#pragma unroll
+    for (int tap = 0; tap < 9; ++tap) acc += w[(c * 128 + ci) * 9 + tap] * x[tap][ci];
+  const float mean = warp_sum(acc) / 32.f;
+  const float d = acc - mean;
+  const float var = warp_sum(d * d) / 32.f;
+  out[(size_t)r * 1024 + f * 32 + c] = fromf<T>(fmaxf(d / sqrtf(var + eps) * nw[c], 0.f));
+}
+template <typename T>
+__global__ void k_clamp(const T* __restrict__ a, T* __restrict__ b, size_t n, float lo, float hi) {
+  for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+    b[i] = fromf<T>(fminf(fmaxf(tof(a[i]), lo), hi));
+}
+template <typename T>
+__global__ void k_silu(T* __restrict__ x, size_t n) {
+  for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+    const float v = tof(x[i]);
+    x[i] = fromf<T>(v / (1.f + expf(-v)));
+  }
+}
+// light conv: GLU over [a | b] (2 x 1024) -> causal depthwise conv (kernel 5, left pad 4, within the clip) ->
+// RMSNorm(conv_norm) -> SiLU, one row per block (256 threads x 4 channels)
+template <typename T>
+__global__ void k_lconv_mid(const T* __restrict__ ab, const int* __restrict__ rows2, const float* __restrict__ dw,
+                            const float* __restrict__ nw, float eps, T* __restrict__ out) {
+  const int r = blockIdx.x, lt = rows2[5 * r + 2];
+  float v[4];
+  float ss = 0.f;
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const int c = threadIdx.x + 256 * k;
+    float acc = 0.f;
+#pragma unroll
+    for (int j = 0; j < 5; ++j) {
+      const int back = 4 - j;
+      if (lt - back < 0) continue;
+      const size_t row = (size_t)(r - back) * 2048;
+      const float a = tof(ab[row + c]), b = tof(ab[row + 1024 + c]);
+      acc += dw[c * 5 + j] * (a / (1.f + expf(-b)));
+    }
+    acc = fminf(fmaxf(acc, -1e10f), 1e10f);
+    v[k] = acc;
+    ss += acc * acc;
+  }
+  const float rr = 1.f / sqrtf(block_sum(ss) / 1024.f + eps);
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const int c = threadIdx.x + 256 * k;
+    const float y = v[k] * rr * nw[c];
+    out[(size_t)r * 1024 + c] = fromf<T>(y / (1.f + expf(-y)));
+  }
+}
+// chunked local attention (port of the CPU op AudioChunkAttention): block = one query row, warp = head (8 x 128).
+// Query i of chunk b sees context slots o = 0..23 (key j = 12 b + o - 12, clip-local); logit = q.k_j + q.relk[o - i]
+// (when 0 <= o - i <= 12), soft-capped at 50; slots out of the clip, out of the 12-frame window or masked get the
+// `invalid` logit; out-of-clip slots contribute no value.
+template <typename T>
+__global__ void k_audio_attn(const T* __restrict__ q, const T* __restrict__ k, const T* __restrict__ v,
+                             const float* __restrict__ qsc, float ksc, const float* __restrict__ relk,
+                             const int* __restrict__ m2, const int* __restrict__ rows2, float softcap, float invalid,
+                             T* __restrict__ out) {
+  const int r = blockIdx.x, h = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int lt = rows2[5 * r + 2], base = rows2[5 * r + 3], len = rows2[5 * r + 4];
+  const int blk = lt / 12, i = lt % 12, hd = h * 128 + lane * 4;
+  float qv[4];
+#pragma unroll
+  for (int d = 0; d < 4; ++d) qv[d] = tof(q[(size_t)r * 1024 + hd + d]) * qsc[lane * 4 + d];
+  float lg[24];
+#pragma unroll
+  for (int o = 0; o < 24; ++o) {
+    const int j = blk * 12 + o - 12;
+    const bool inr = j >= 0 && j < len;
+    float part = 0.f;
+    if (inr) {
+#pragma unroll
+      for (int d = 0; d < 4; ++d) part += qv[d] * (tof(k[(size_t)(base + j) * 1024 + hd + d]) * ksc);
+    }
+    const int p = o - i;
+    if (p >= 0 && p <= 12) {
+#pragma unroll
+      for (int d = 0; d < 4; ++d) part += qv[d] * relk[p * 1024 + hd + d];
+    }
+    const float acc = warp_sum(part);
+    const float capped = tanhf(acc / softcap) * softcap;
+    const int dd = lt - j;
+    const bool ok = inr && dd >= 0 && dd < 12 && m2[base + j];
+    lg[o] = ok ? capped : invalid;
+  }
+  float mx = -INFINITY;
+#pragma unroll
+  for (int o = 0; o < 24; ++o) mx = fmaxf(mx, lg[o]);
+  float z = 0.f;
+#pragma unroll
+  for (int o = 0; o < 24; ++o) {
+    lg[o] = expf(lg[o] - mx);
+    z += lg[o];
+  }
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int o = 0; o < 24; ++o) {
+    const int j = blk * 12 + o - 12;
+    if (j < 0 || j >= len) continue;
+    const float wgt = lg[o] / z;
+#pragma unroll
+    for (int d = 0; d < 4; ++d) acc[d] += wgt * tof(v[(size_t)(base + j) * 1024 + hd + d]);
+  }
+#pragma unroll
+  for (int d = 0; d < 4; ++d) out[(size_t)r * 1024 + hd + d] = fromf<T>(acc[d]);
+}
+// output_proj bias + embed_audio pre-norm (RMS, no weight) for the soft-token rows, compacted
+template <typename T>
+__global__ void k_bias_rms_gather(const T* __restrict__ x, const float* __restrict__ bias, const int* __restrict__ rows,
+                                  float eps, T* __restrict__ out, int n) {
+  const int s = blockIdx.x;
+  const size_t src = rows[s];
+  float v[8];
+  int k = 0;
+  float ss = 0.f;
+  for (int c = threadIdx.x; c < n; c += blockDim.x, ++k) {
+    v[k] = tof(x[src * n + c]) + bias[c];
+    ss += v[k] * v[k];
+  }
+  const float r = 1.f / sqrtf(block_sum(ss) / n + eps);
+  k = 0;
+  for (int c = threadIdx.x; c < n; c += blockDim.x, ++k) out[(size_t)s * n + c] = fromf<T>(v[k] * r);
 }
 
 // RoPE description: rotated channels c < 2*half*parts are rotated in pairs (c, c +- half) inside their part
@@ -1469,6 +1658,13 @@ struct Lin {  // weight [n, k] row-major in the compute dtype
   uint8_t* wsf = nullptr;
   float alpha = 1.f;
   int qfmt = 0;
+  float clip[4] = {-INFINITY, INFINITY, -INFINITY, INFINITY};  // Gemma 4 clippable linear: input / output bounds
+};
+
+struct ALayer {  // Gemma 4 audio conformer layer
+  Lin f1a, f1b, f2a, f2b, ls, le, q, k, v, post;
+  float *f1_pre, *f1_post, *f2_pre, *f2_post, *lc_pre, *lc_conv, *pre_attn, *post_attn, *out;
+  float *dw, *qsc, *relk;  // depthwise conv [1024 x 5], q scale per dim, relative keys [13 x 1024] (fp32)
 };
 
 struct GLayer {  // EmbeddingGemma 2 text layer / Gemma 4 vision layer
@@ -1497,6 +1693,10 @@ struct Engine {
   std::unordered_map<std::string, cublasLtMatmulAlgo_t> algos;
   cudaStream_t st = nullptr;
   cublasHandle_t cb = nullptr;
+  void* cd = nullptr;  // cuDNN attention context (bf16), cd_state: 0 untried, 1 on, -1 off
+  int cd_state = 0;
+  int* cd_meta = nullptr;  // ragged offsets / lengths for cuDNN, 3 x cd_cap ints
+  int cd_cap = 0;
   void* ws = nullptr;
   std::unordered_map<std::string, DBuf> raw;           // uploaded bf16 tensors by name
   std::unordered_map<std::string, std::vector<int64_t>> shapes;
@@ -1538,6 +1738,17 @@ struct Engine {
   // vision buffers
   void *v_pix, *v_y, *v_qkv, *v_o, *v_t1, *v_gu, *v_m, *v_ev, *v_soft;
   float *v_h, *v_patch_f32;
+  // audio tower
+  bool has_audio = false;
+  int max_frames = 0;
+  float a_ksc = 1.f, a_softcap = 50.f, a_invalid = -1e9f, a_resw = 0.5f;
+  float *a_c0w = nullptr, *a_c0n = nullptr, *a_c1w = nullptr, *a_c1n = nullptr, *a_out_b = nullptr;
+  Lin a_in, a_outp, a_emb;
+  std::vector<ALayer> al;
+  float *a_feat = nullptr, *a_l0 = nullptr, *a_h = nullptr;
+  void *a_x = nullptr, *a_y = nullptr, *a_big = nullptr, *a_tmp = nullptr, *a_q = nullptr, *a_k = nullptr, *a_v = nullptr,
+       *a_o = nullptr, *a_t1 = nullptr, *a_proj = nullptr, *a_e = nullptr, *a_soft = nullptr;
+  const void* soft_src = nullptr;  // soft tokens for the next text forward (vision or audio)
   // NeoMME patch buffers
   uint8_t* n_patch_u8 = nullptr;
   // Gemma GPU image preprocessing: decoded source images, horizontal-pass output, coefficients
@@ -1872,7 +2083,14 @@ struct Meta {
   int* x1 = nullptr;  // extra arrays (vision slots / NeoMME patch rows)
   int* x2 = nullptr;
   int* x3 = nullptr;
+  int nseq = 0, smax = 0, ntok = 0;  // host copies (cuDNN attention)
 };
+void set_seqs(Meta& m, const std::vector<int>& cu) {
+  m.nseq = (int)cu.size() - 1;
+  m.ntok = cu.empty() ? 0 : cu.back();
+  m.smax = 0;
+  for (int s = 0; s < m.nseq; ++s) m.smax = std::max(m.smax, cu[s + 1] - cu[s]);
+}
 
 // pack host int arrays into the pinned buffer, copy once, return device pointers
 struct Packer {
@@ -1959,9 +2177,84 @@ bool force_simt() {
   return v;
 }
 
+// NeoMME after cuDNN attention: exclusive self-attention against the token's own value vector, then the sigmoid
+// gate (the same math as the k_attn_mma epilogue, from the bf16 attention output). One warp per (token, head).
+template <int D>
+__global__ void k_excl_gate(AttnArgs a, int ntok) {
+  constexpr int CPL = D / 32;
+  const int w = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+  if (w >= ntok * a.Hq) return;
+  const int row = w / a.Hq, h = w % a.Hq, hk = h / (a.Hq / a.Hkv);
+  const bf16* base = (const bf16*)a.qkv + (size_t)row * a.ld;
+  bf16* out = (bf16*)a.out + (size_t)row * a.ld_out + h * D;
+  float o[CPL], v[CPL], vn = 0.f, dot = 0.f;
+#pragma unroll
+  for (int c = 0; c < CPL; ++c) {
+    o[c] = __bfloat162float(out[lane + 32 * c]);
+    v[c] = __bfloat162float(base[a.v_off + hk * D + lane + 32 * c]);
+    vn += v[c] * v[c];
+    dot += o[c] * v[c];
+  }
+  vn = warp_sum(vn);
+  dot = warp_sum(dot);
+  const float nrm = fmaxf(sqrtf(vn), 1e-12f), proj = dot / (nrm * nrm), ta = a.alpha_t[h];
+#pragma unroll
+  for (int c = 0; c < CPL; ++c) {
+    const float g = __bfloat162float(base[a.g_off + h * D + lane + 32 * c]);
+    out[lane + 32 * c] = __float2bfloat16((o[c] - ta * proj * v[c]) / (1.f + expf(-g)));
+  }
+}
+
+// cuDNN attention with FLASHEMBED_ATTN=cudnn (opt-in while it is being evaluated); off for the run after a failure
+bool use_cudnn(Engine& e) {
+  if (e.cd_state == 0) {
+    const char* x = getenv("FLASHEMBED_ATTN");
+    const std::string v = x ? x : "";
+    if (v != "cudnn") {
+      e.cd_state = -1;
+    } else {
+      e.cd = fecd_new(e.st);
+      e.cd_state = e.cd ? 1 : -1;
+      if (!e.cd && v == "cudnn") throw FeErr(std::string("FLASHEMBED_ATTN=cudnn: ") + fecd_error());
+    }
+  }
+  return e.cd_state == 1;
+}
+
 template <typename T>
 void attention(Engine& e, int D, const AttnArgs& a0, const Meta& m) {
   AttnArgs a = a0;
+  if (std::is_same<T, bf16>::value && m.nseq > 0 && use_cudnn(e)) {
+    const bf16* b = (const bf16*)a.qkv;
+    int nb = 1;
+    while (nb < m.nseq) nb <<= 1;  // power-of-two sequence slots: few distinct cuDNN graphs
+    if (nb + 1 > e.cd_cap) {
+      if (e.cd_meta) CK(cudaFree(e.cd_meta));
+      e.cd_cap = std::max(nb + 1, 1024);
+      CK(cudaMalloc(&e.cd_meta, (size_t)3 * e.cd_cap * sizeof(int)));
+    }
+    int *rag = e.cd_meta, *rago = rag + e.cd_cap, *sl = rago + e.cd_cap;
+    k_cd_meta<<<(nb + 1 + 255) / 256, 256, 0, e.st>>>(a.cu, m.nseq, nb, a.ld, a.ld_out, rag, rago, sl);
+    CK(cudaGetLastError());
+    if (fecd_attn(e.cd, nb, m.smax, a.Hq, a.Hkv, D, a.window, a.scale, b + a.q_off, b + a.k_off, b + a.v_off, a.out,
+                  a.ld, a.ld_out, rag, rago, sl) == 0) {
+      if (a.alpha_t) {
+        REQ(D == 64 || D == 128 || D == 256, "exclusive attention head dim");
+        const size_t thr = (size_t)m.ntok * a.Hq * 32;
+        const int nb = (int)((thr + 255) / 256);
+        if (D == 64) k_excl_gate<64><<<nb, 256, 0, e.st>>>(a, m.ntok);
+        else if (D == 128) k_excl_gate<128><<<nb, 256, 0, e.st>>>(a, m.ntok);
+        else k_excl_gate<256><<<nb, 256, 0, e.st>>>(a, m.ntok);
+        CK(cudaGetLastError());
+      }
+      return;
+    }
+    if (getenv("FLASHEMBED_ATTN") && std::string(getenv("FLASHEMBED_ATTN")) == "cudnn")
+      throw FeErr(std::string("cuDNN attention: ") + fecd_error());
+    fprintf(stderr, "flashembed-gpu: cuDNN attention unavailable for this shape (%s); using the built-in kernels\n",
+            fecd_error());
+    e.cd_state = -1;
+  }
   if (std::is_same<T, bf16>::value && !force_simt()) {
     a.tiles = m.tiles64;
     if (!m.nt64) return;
@@ -2025,7 +2318,7 @@ void plan(Engine& e) {
   }
   const size_t H = e.H;
   // metadata ints: ids, cu, pos(2), mm, 2 tile lists (2 ints each), extras
-  e.meta_ints = (T * 12 + 64 * 1024 + (size_t)e.max_patch * 4) + 4096;
+  e.meta_ints = (T * 12 + 64 * 1024 + (size_t)e.max_patch * 4) + 4096 + (e.has_audio ? (size_t)e.max_frames * 7 + 8192 : 0);
   size_t need = 0;
   auto add = [&](size_t b) { need += (b + 255) / 256 * 256; };
   add(T * H * es);            // y
@@ -2068,6 +2361,16 @@ void plan(Engine& e) {
     add(P * VH * 4);            // h
     add(P / 4 * VH * es);       // ev (pooled, pre-projection)
     add(P / 4 * H * es);        // soft tokens
+  }
+  if (e.has_audio) {
+    const size_t F0 = e.max_frames, F1 = F0 / 2 + 1024, F2 = F0 / 4 + 1024;
+    add(F0 * 128 * 4);                 // features
+    add(F1 * 64 * 128 * 4);            // conv 0 output
+    add(F2 * 1024 * 4);                // h
+    add(F2 * 1024 * es * 8);           // x, y, q, k, v, o, t1, tmp(1024)
+    add(F2 * 4096 * es * 2);           // big, tmp
+    add(F2 * 1536 * es * 2);           // proj, e
+    add(F2 * 512 * es);                // soft
   }
   if (e.quant) {
     int kmax = 0;
@@ -2129,14 +2432,126 @@ void plan(Engine& e) {
     e.v_ev = carve(e, P / 4 * VH * es);
     e.v_soft = carve(e, P / 4 * H * es);
   }
+  if (e.has_audio) {
+    const size_t F0 = e.max_frames, F1 = F0 / 2 + 1024, F2 = F0 / 4 + 1024;
+    e.a_feat = (float*)carve(e, F0 * 128 * 4);
+    e.a_l0 = (float*)carve(e, F1 * 64 * 128 * 4);
+    e.a_h = (float*)carve(e, F2 * 1024 * 4);
+    void** bufs[] = {&e.a_x, &e.a_y, &e.a_q, &e.a_k, &e.a_v, &e.a_o, &e.a_t1};
+    for (void** b : bufs) *b = carve(e, F2 * 1024 * es);
+    carve(e, F2 * 1024 * es);
+    e.a_big = carve(e, F2 * 4096 * es);
+    e.a_tmp = carve(e, F2 * 4096 * es);
+    e.a_proj = carve(e, F2 * 1536 * es);
+    e.a_e = carve(e, F2 * 1536 * es);
+    e.a_soft = carve(e, F2 * 512 * es);
+  }
   // pinned staging: metadata + largest float input (patches)
-  e.pin_bytes = e.meta_ints * 4 + 64 +
+  e.pin_bytes = e.meta_ints * 4 + 64 + (e.has_audio ? (size_t)e.max_frames * 128 * 4 : 0) +
                 (e.arch == ARCH_NEOMME ? (size_t)e.max_patch * 3072
                                        : (e.has_vision ? std::max<size_t>((size_t)e.max_patch * 768 * 4, e.img_bytes + (4 << 20)) : 0));
   CK(cudaMallocHost((void**)&e.pin, e.pin_bytes));
 }
 
 // ------------------------------------------------------------------------------------------------- build
+
+// ---- Gemma 4 audio tower weights
+void set_clip(Engine& e, Lin& L, const std::string& p) {  // Gemma4ClippableLinear bounds (inf = no clamp)
+  if (!has(e, p + "input_min")) return;
+  L.clip[0] = host_scalar(e, p + "input_min");
+  L.clip[1] = host_scalar(e, p + "input_max");
+  L.clip[2] = host_scalar(e, p + "output_min");
+  L.clip[3] = host_scalar(e, p + "output_max");
+}
+Lin clip_lin_w(Engine& e, const std::string& p) {
+  Lin L = make_lin(e, {p + "linear.weight"});
+  set_clip(e, L, p);
+  return L;
+}
+void build_audio(Engine& e) {
+  const std::string A = "audio_tower.";
+  REQ((int)cfgv(e, "a_hidden") == 1024 && (int)cfgv(e, "a_heads") == 8 && (int)cfgv(e, "a_chunk") == 12 &&
+          (int)cfgv(e, "a_left") == 13 && (int)cfgv(e, "a_right") == 0 && (int)cfgv(e, "a_kernel") == 5,
+      "unsupported Gemma 4 audio config");
+  e.has_audio = true;
+  const int L = (int)cfgv(e, "a_layers");
+  e.a_softcap = (float)cfgv(e, "a_softcap");
+  e.a_invalid = (float)cfgv(e, "a_invalid");
+  e.a_resw = (float)cfgv(e, "a_resw");
+  const float eps = (float)cfgv(e, "a_eps");
+  REQ(fabsf(eps - e.eps) < 1e-12f, "audio eps differs from the text eps");
+  e.a_c0w = to_f32(e, A + "subsample_conv_projection.layer0.conv.weight");
+  e.a_c0n = to_f32(e, A + "subsample_conv_projection.layer0.norm.weight");
+  e.a_c1w = to_f32(e, A + "subsample_conv_projection.layer1.conv.weight");
+  e.a_c1n = to_f32(e, A + "subsample_conv_projection.layer1.norm.weight");
+  e.a_in = make_lin(e, {A + "subsample_conv_projection.input_proj_linear.weight"});
+  e.a_outp = make_lin(e, {A + "output_proj.weight"});
+  e.a_out_b = to_f32(e, A + "output_proj.bias");
+  e.a_emb = make_lin(e, {"embed_audio.embedding_projection.weight"});
+  // relative position table: positions 12..0, [sin | cos] over 512 timescales (Gemma4AudioRelPositionalEncoding)
+  const int nts = 512;
+  const double inc = std::log(10000.0) / (nts - 1);
+  std::vector<float> pe(13 * 1024);
+  for (int r = 0; r < 13; ++r)
+    for (int i = 0; i < nts; ++i) {
+      const float inv = (float)std::exp((float)(i * -inc));  // torch: exp of a float32 tensor
+      const float st = (float)(12 - r) * inv;
+      pe[r * 1024 + i] = std::sin(st);
+      pe[r * 1024 + nts + i] = std::cos(st);
+    }
+  float* pe_d = (float*)dmalloc(e, pe.size() * 4);
+  CK(cudaMemcpy(pe_d, pe.data(), pe.size() * 4, cudaMemcpyHostToDevice));
+  void* pe_t = pe_d;
+  if (e.dt == DT_BF16) {  // the reference casts the table to the hidden dtype before relative_k_proj
+    pe_t = dmalloc(e, pe.size() * 2);
+    k_affine<bf16><<<64, 256, 0, e.st>>>(pe_d, (bf16*)pe_t, 1.f, 0.f, pe.size());
+  }
+  void* rk_t = dmalloc(e, 13 * 1024 * 4);
+  const double q_scale = std::pow(128.0, -0.5) / std::log(2.0);
+  e.a_ksc = (float)(std::log1p(std::exp(1.0)) / std::log(2.0));
+  for (int i = 0; i < L; ++i) {
+    const std::string p = A + "layers." + std::to_string(i) + ".";
+    ALayer l;
+    l.f1a = clip_lin_w(e, p + "feed_forward1.ffw_layer_1.");
+    l.f1b = clip_lin_w(e, p + "feed_forward1.ffw_layer_2.");
+    l.f2a = clip_lin_w(e, p + "feed_forward2.ffw_layer_1.");
+    l.f2b = clip_lin_w(e, p + "feed_forward2.ffw_layer_2.");
+    l.ls = clip_lin_w(e, p + "lconv1d.linear_start.");
+    l.le = clip_lin_w(e, p + "lconv1d.linear_end.");
+    l.q = clip_lin_w(e, p + "self_attn.q_proj.");
+    l.k = clip_lin_w(e, p + "self_attn.k_proj.");
+    l.v = clip_lin_w(e, p + "self_attn.v_proj.");
+    l.post = clip_lin_w(e, p + "self_attn.post.");
+    l.f1_pre = to_f32(e, p + "feed_forward1.pre_layer_norm.weight");
+    l.f1_post = to_f32(e, p + "feed_forward1.post_layer_norm.weight");
+    l.f2_pre = to_f32(e, p + "feed_forward2.pre_layer_norm.weight");
+    l.f2_post = to_f32(e, p + "feed_forward2.post_layer_norm.weight");
+    l.lc_pre = to_f32(e, p + "lconv1d.pre_layer_norm.weight");
+    l.lc_conv = to_f32(e, p + "lconv1d.conv_norm.weight");
+    l.pre_attn = to_f32(e, p + "norm_pre_attn.weight");
+    l.post_attn = to_f32(e, p + "norm_post_attn.weight");
+    l.out = to_f32(e, p + "norm_out.weight");
+    l.dw = to_f32(e, p + "lconv1d.depthwise_conv1d.weight");
+    std::vector<float> qs(128);
+    for (int d = 0; d < 128; ++d) {
+      const double x = host_scalar(e, p + "self_attn.per_dim_scale", d);
+      qs[d] = (float)(q_scale * (x > 20 ? x : std::log1p(std::exp(x))));
+    }
+    l.qsc = (float*)dmalloc(e, 128 * 4);
+    CK(cudaMemcpy(l.qsc, qs.data(), 128 * 4, cudaMemcpyHostToDevice));
+    Lin rk = make_lin(e, {p + "self_attn.relative_k_proj.weight"});
+    gemm(e, pe_t, rk, rk_t, 13);
+    l.relk = (float*)dmalloc(e, 13 * 1024 * 4);
+    if (e.dt == DT_BF16) k_bf16_to_f32<<<64, 256, 0, e.st>>>((const bf16*)rk_t, l.relk, 13 * 1024);
+    else CK(cudaMemcpyAsync(l.relk, rk_t, 13 * 1024 * 4, cudaMemcpyDeviceToDevice, e.st));
+    CK(cudaStreamSynchronize(e.st));
+    dfree(e, rk.w);
+    e.weight_bytes -= (size_t)rk.n * rk.k * e.esz();
+    e.al.push_back(l);
+  }
+  CK(cudaStreamSynchronize(e.st));
+}
+
 void build_gemma(Engine& e) {
   const std::string P = "language_model.";
   e.H = (int)cfgv(e, "hidden");
@@ -2339,6 +2754,7 @@ void gemma_vision(Engine& e, int npatch, int nimg, const std::vector<int>& vcu, 
   if (im.src) pk.add(im.desc, (size_t)nimg * D_N);
   auto d = pk.go();
   Meta m;
+  set_seqs(m, vcu);
   m.cu = d[0];
   m.pos = d[1];
   m.tiles16 = (int2*)d[2];
@@ -2379,6 +2795,87 @@ void gemma_vision(Engine& e, int npatch, int nimg, const std::vector<int>& vcu, 
   k_vis_pool<T><<<nslot, 256, 0, e.st>>>(e.v_h, d[4], d[5], 1.f / 9.f, sqrtf((float)e.VH), e.veps, (T*)e.v_ev, e.VH);
   CK(cudaGetLastError());
   gemm(e, e.v_ev, e.vev, e.v_soft, nslot);
+  e.soft_src = e.v_soft;
+}
+
+
+// Gemma 4 audio tower on packed clips -> soft tokens (e.a_soft) for the next text forward
+template <typename T>
+void clip_gemm(Engine& e, const void* X, const Lin& L, void* Y, int M) {
+  const void* in = X;
+  if (std::isfinite(L.clip[0]) || std::isfinite(L.clip[1])) {
+    k_clamp<T><<<nblk((size_t)M * L.k), 256, 0, e.st>>>((const T*)X, (T*)e.a_tmp, (size_t)M * L.k, L.clip[0], L.clip[1]);
+    in = e.a_tmp;
+  }
+  gemm(e, in, L, Y, M);
+  if (std::isfinite(L.clip[2]) || std::isfinite(L.clip[3]))
+    k_clamp<T><<<nblk((size_t)M * L.n), 256, 0, e.st>>>((const T*)Y, (T*)Y, (size_t)M * L.n, L.clip[2], L.clip[3]);
+  CK(cudaGetLastError());
+}
+
+template <typename T>
+void gemma_audio(Engine& e, int nclip, const int* cu0, const float* feats, const int* m0, int n1, const int* rows1,
+                 const int* m1, int n2, const int* rows2, const int* m2, int nsoft, const int* soft_rows) {
+  const int n0 = cu0[nclip];
+  REQ(n0 <= e.max_frames, "audio batch exceeds the frame budget");
+  Packer pk(e);
+  pk.add(m0, n0);
+  pk.add(rows1, (size_t)n1 * 3);
+  pk.add(m1, n1);
+  pk.add(rows2, (size_t)n2 * 5);
+  pk.add(m2, n2);
+  pk.add(soft_rows, nsoft);
+  auto d = pk.go();
+  const size_t pin_off = e.meta_ints * 4;
+  std::memcpy(e.pin + pin_off, feats, (size_t)n0 * 128 * 4);
+  CK(cudaMemcpyAsync(e.a_feat, e.pin + pin_off, (size_t)n0 * 128 * 4, cudaMemcpyHostToDevice, e.st));
+  k_aconv0<<<dim3(n1, 64), 128, 0, e.st>>>(e.a_feat, d[0], d[1], e.a_c0w, e.a_c0n, e.eps, e.a_l0);
+  k_aconv1<T><<<dim3(n2, 32), 32, 0, e.st>>>(e.a_l0, d[2], d[3], e.a_c1w, e.a_c1n, e.eps, (T*)e.a_x);
+  CK(cudaGetLastError());
+  gemm(e, e.a_x, e.a_in, e.a_t1, n2);
+  const int H = 1024;
+  // h = input projection; y = ff1 pre-norm
+  resid_norm<T>(e, n2, H, e.a_t1, 3, nullptr, 0.f, e.a_h, 1.f, nullptr, 0, 0, 1, e.al[0].f1_pre, e.a_y, nullptr);
+  for (size_t li = 0; li < e.al.size(); ++li) {
+    ALayer& l = e.al[li];
+    // feed-forward 1: h += 0.5 * rms(ffw2(silu(ffw1(y)))); y = attention pre-norm
+    clip_gemm<T>(e, e.a_y, l.f1a, e.a_big, n2);
+    k_silu<T><<<nblk((size_t)n2 * 4096), 256, 0, e.st>>>((T*)e.a_big, (size_t)n2 * 4096);
+    clip_gemm<T>(e, e.a_big, l.f1b, e.a_t1, n2);
+    resid_norm<T>(e, n2, H, e.a_t1, 4, l.f1_post, e.a_resw, e.a_h, 1.f, nullptr, 0, 0, 1, l.pre_attn, e.a_y, nullptr);
+    // chunked attention
+    clip_gemm<T>(e, e.a_y, l.q, e.a_q, n2);
+    clip_gemm<T>(e, e.a_y, l.k, e.a_k, n2);
+    clip_gemm<T>(e, e.a_y, l.v, e.a_v, n2);
+    k_audio_attn<T><<<n2, 256, 0, e.st>>>((const T*)e.a_q, (const T*)e.a_k, (const T*)e.a_v, l.qsc, e.a_ksc, l.relk, d[4],
+                                         d[3], e.a_softcap, e.a_invalid, (T*)e.a_o);
+    CK(cudaGetLastError());
+    clip_gemm<T>(e, e.a_o, l.post, e.a_t1, n2);
+    resid_norm<T>(e, n2, H, e.a_t1, 1, l.post_attn, 0.f, e.a_h, 1.f, nullptr, 0, 0, 1, l.lc_pre, e.a_y, nullptr);
+    // light conv: h += linear_end(silu(rms(dwconv(glu(linear_start(y))))))
+    clip_gemm<T>(e, e.a_y, l.ls, e.a_big, n2);
+    k_lconv_mid<T><<<n2, 256, 0, e.st>>>((const T*)e.a_big, d[3], l.dw, l.lc_conv, e.eps, (T*)e.a_o);
+    CK(cudaGetLastError());
+    clip_gemm<T>(e, e.a_o, l.le, e.a_t1, n2);
+    resid_norm<T>(e, n2, H, e.a_t1, 2, nullptr, 1.f, e.a_h, 1.f, nullptr, 0, 0, 1, l.f2_pre, e.a_y, nullptr);
+    // feed-forward 2, then h = norm_out(h)
+    clip_gemm<T>(e, e.a_y, l.f2a, e.a_big, n2);
+    k_silu<T><<<nblk((size_t)n2 * 4096), 256, 0, e.st>>>((T*)e.a_big, (size_t)n2 * 4096);
+    clip_gemm<T>(e, e.a_big, l.f2b, e.a_t1, n2);
+    resid_norm<T>(e, n2, H, e.a_t1, 4, l.f2_post, e.a_resw, e.a_h, 1.f, nullptr, 0, 0, 1, l.out, nullptr, e.a_h);
+    // next layer's ff1 pre-norm (or the input of output_proj)
+    if (li + 1 < e.al.size())
+      resid_norm<T>(e, n2, H, nullptr, 0, nullptr, 0.f, e.a_h, 1.f, nullptr, 0, 0, 1, e.al[li + 1].f1_pre, e.a_y, nullptr);
+    else
+      resid_norm<T>(e, n2, H, nullptr, 0, nullptr, 0.f, e.a_h, 1.f, nullptr, 0, 0, 2, nullptr, e.a_y, nullptr);
+  }
+  gemm(e, e.a_y, e.a_outp, e.a_proj, n2);
+  if (nsoft) {
+    k_bias_rms_gather<T><<<nsoft, 256, 0, e.st>>>((const T*)e.a_proj, e.a_out_b, d[5], e.eps, (T*)e.a_e, e.a_outp.n);
+    CK(cudaGetLastError());
+    gemm(e, e.a_e, e.a_emb, e.a_soft, nsoft);
+  }
+  e.soft_src = e.a_soft;
 }
 
 template <typename T>
@@ -2401,6 +2898,7 @@ void gemma_text(Engine& e, int ntok, int nseq, const int* ids, const int* cu_h, 
   if (mm_idx) pk.add(mm_idx, ntok);
   auto d = pk.go();
   Meta m;
+  set_seqs(m, cu);
   m.ids = d[0];
   m.cu = d[1];
   m.pos = d[2];
@@ -2411,7 +2909,7 @@ void gemma_text(Engine& e, int ntok, int nseq, const int* ids, const int* cu_h, 
   m.tiles64 = (int2*)d[5];
   m.nt64 = t64.n;
   const int H = e.H;
-  k_gemma_embed<T><<<ntok, 128, 0, e.st>>>(m.ids, e.embed, e.embed_scale, mm_idx ? d[6] : nullptr, (const T*)e.v_soft,
+  k_gemma_embed<T><<<ntok, 128, 0, e.st>>>(m.ids, e.embed, e.embed_scale, mm_idx ? d[6] : nullptr, (const T*)e.soft_src,
                                            e.b_h, (T*)e.b_e, H);
   CK(cudaGetLastError());
   resid_norm<T>(e, ntok, H, nullptr, 0, nullptr, 0.f, e.b_h, 1.f, nullptr, 0, 0, 1, e.gl[0].w_in, e.b_y, nullptr);
@@ -2452,6 +2950,7 @@ void neomme(Engine& e, int ntok, int nseq, const int* ids, const int* cu_h, cons
   pk.add(t64.host.data(), t64.host.size());
   auto d = pk.go();
   Meta m;
+  set_seqs(m, cu);
   m.ids = d[0];
   m.cu = d[1];
   m.pos = d[2];
@@ -2602,6 +3101,10 @@ int fe_build(void* h, int max_tokens, int max_patches) {
     e.img_bytes = (size_t)cfgv(e, "img_bytes", 0);
     if (e.arch == ARCH_GEMMA) build_gemma(e);
     else build_neomme(e);
+    if (e.arch == ARCH_GEMMA && cfgv(e, "audio", 0) != 0) {
+      e.max_frames = (int)cfgv(e, "max_frames", 12000);
+      build_audio(e);
+    }
     e.quant = (int)cfgv(e, "quant", 0);
     if (e.quant) {  // the layer GEMMs (embedding / patch / output heads stay bf16)
       for (auto& l : e.gl)
@@ -2668,6 +3171,22 @@ int fe_gemma_vision_u8(void* h, int npatch, int nimg, const int32_t* vcu, const 
   });
 }
 
+// Gemma 4 audio tower on packed clips (log-mel features [frames, 128] per clip back to back). Row maps per stage
+// (see k_aconv0 / k_aconv1 / k_audio_attn): rows1 [n1 x 3] = (clip start in frames, clip frames, local index),
+// rows2 [n2 x 5] = (clip start in stage-1 rows, clip stage-1 rows, local index, clip start in stage-2 rows, clip
+// stage-2 rows); m0 / m1 / m2 = validity masks per stage; soft_rows = stage-2 rows that become soft tokens, in order.
+int fe_gemma_audio(void* h, int nclip, const int32_t* cu0, const float* feats, const int32_t* m0, int n1,
+                   const int32_t* rows1, const int32_t* m1, int n2, const int32_t* rows2, const int32_t* m2, int nsoft,
+                   const int32_t* soft_rows) {
+  return guard([&] {
+    Engine& e = *(Engine*)h;
+    REQ(e.has_audio, "engine built without the audio tower");
+    REQ(n2 <= e.max_frames / 4 + 1024 && n1 <= e.max_frames / 2 + 1024, "audio batch too large");
+    if (e.dt == DT_F32) gemma_audio<float>(e, nclip, cu0, feats, m0, n1, rows1, m1, n2, rows2, m2, nsoft, soft_rows);
+    else gemma_audio<bf16>(e, nclip, cu0, feats, m0, n1, rows1, m1, n2, rows2, m2, nsoft, soft_rows);
+  });
+}
+
 // NeoMME: text (pos2 = null) or document images (pos2 [ntok, 2] (row, col); patches [npatch, 3072] for rows
 // patch_rows). dense [nseq, 1024]; late [ntok, 128] (nullable)
 int fe_neomme(void* h, int ntok, int nseq, const int32_t* ids, const int32_t* cu, const int32_t* pos2, int npatch,
@@ -2686,9 +3205,101 @@ int fe_mem(void* h, uint64_t* out) {
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
     out[0] = e.weight_bytes;
-    out[1] = e.arena_bytes;
+    out[1] = e.arena_bytes + fecd_bytes(e.cd) + (size_t)3 * e.cd_cap * sizeof(int);
     out[2] = tot - fr;
     out[3] = tot;
+  });
+}
+
+// attention micro-benchmark: nseq packed sequences of S tokens, random bf16 / fp32 q, k, v; mean ms per call
+int fe_attn_bench(int dtype, int D, int Hq, int Hkv, int S, int nseq, int window, int iters, float* ms) {
+  return guard([&] {
+    Engine e;
+    e.dt = dtype;
+    CK(cudaStreamCreateWithFlags(&e.st, cudaStreamNonBlocking));
+    const int ntok = S * nseq, ld = (Hq + 2 * Hkv) * D;
+    const size_t es = dtype == DT_BF16 ? 2 : 4;
+    void *qkv = nullptr, *out = nullptr, *dm = nullptr;
+    CK(cudaMalloc(&qkv, (size_t)ntok * ld * es));
+    CK(cudaMalloc(&out, (size_t)ntok * Hq * D * es));
+    std::vector<int> cu(nseq + 1);
+    for (int i = 0; i <= nseq; ++i) cu[i] = i * S;
+    Tiles t;
+    build_tiles(cu, 64, t);
+    const size_t cpad = (cu.size() + 63) / 64 * 64;  // keep the int2 tile array 8-byte (here 256-byte) aligned
+    CK(cudaMalloc(&dm, (cpad + t.host.size()) * 4));
+    CK(cudaMemcpy(dm, cu.data(), cu.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy((int*)dm + cpad, t.host.data(), t.host.size() * 4, cudaMemcpyHostToDevice));
+    {  // deterministic pseudo-random fill in [-1, 1)
+      std::vector<uint16_t> hb;
+      std::vector<float> hf;
+      const size_t n = (size_t)ntok * ld;
+      uint32_t x = 12345;
+      if (dtype == DT_BF16) {
+        hb.resize(n);
+        for (auto& v : hb) { x = x * 1664525u + 1013904223u; float f = (x >> 8) * (2.f / 16777216.f) - 1.f; uint32_t u; std::memcpy(&u, &f, 4); v = (uint16_t)(u >> 16); }
+        CK(cudaMemcpy(qkv, hb.data(), n * 2, cudaMemcpyHostToDevice));
+      } else {
+        hf.resize(n);
+        for (auto& v : hf) { x = x * 1664525u + 1013904223u; v = (x >> 8) * (2.f / 16777216.f) - 1.f; }
+        CK(cudaMemcpy(qkv, hf.data(), n * 4, cudaMemcpyHostToDevice));
+      }
+    }
+    Meta m;
+    set_seqs(m, cu);
+    m.cu = (int*)dm;
+    m.tiles64 = (int2*)((int*)dm + cpad);
+    m.nt64 = t.n;
+    Tiles t16, t32;
+    build_tiles(cu, 16, t16);
+    build_tiles(cu, 32, t32);
+    void* dm2 = nullptr;
+    const size_t t16pad = (t16.host.size() + 63) / 64 * 64;
+    CK(cudaMalloc(&dm2, (t16pad + t32.host.size()) * 4));
+    CK(cudaMemcpy(dm2, t16.host.data(), t16.host.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy((int*)dm2 + t16pad, t32.host.data(), t32.host.size() * 4, cudaMemcpyHostToDevice));
+    m.tiles16 = (int2*)dm2;
+    m.nt16 = t16.n;
+    m.tiles32 = (int2*)((int*)dm2 + t16pad);
+    m.nt32 = t32.n;
+    AttnArgs a{};
+    a.qkv = qkv;
+    a.ld = ld;
+    a.q_off = 0;
+    a.k_off = Hq * D;
+    a.v_off = (Hq + Hkv) * D;
+    a.Hq = Hq;
+    a.Hkv = Hkv;
+    a.window = window;
+    a.scale = 1.f / sqrtf((float)D);
+    a.cu = m.cu;
+    a.out = out;
+    a.ld_out = Hq * D;
+    auto run = [&] {
+      if (dtype == DT_BF16) attention<bf16>(e, D, a, m);
+      else attention<float>(e, D, a, m);
+    };
+    run();
+    CK(cudaStreamSynchronize(e.st));
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0));
+    CK(cudaEventCreate(&e1));
+    CK(cudaEventRecord(e0, e.st));
+    for (int i = 0; i < iters; ++i) run();
+    CK(cudaEventRecord(e1, e.st));
+    CK(cudaEventSynchronize(e1));
+    CK(cudaEventElapsedTime(ms, e0, e1));
+    *ms /= iters;
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    cudaFree(qkv);
+    cudaFree(out);
+    cudaFree(dm);
+    cudaFree(dm2);
+    if (e.cd) fecd_free(e.cd);
+    if (e.cd_meta) cudaFree(e.cd_meta);
+    cudaStreamDestroy(e.st);
+    e.st = nullptr;
   });
 }
 
@@ -2709,6 +3320,8 @@ void fe_free(void* h) {
   Engine* e = (Engine*)h;
   if (!e) return;
   cudaStreamSynchronize(e->st);
+  if (e->cd) fecd_free(e->cd);
+  if (e->cd_meta) cudaFree(e->cd_meta);
   for (auto& kv : e->raw) cudaFree(kv.second.p);
   for (void* p : e->owned) cudaFree(p);
   if (e->pin) cudaFreeHost(e->pin);

@@ -164,6 +164,106 @@ For reference, bf16 is at median 0.99999, min 0.9986-0.9999.
 - **INT8 was not built.** On these GPUs INT8 tensor-core throughput is the same as FP8, and cuBLASLt offers only
   tensor-wide scaling for INT8 (no block scaling), so it would be no faster than MXFP8 and less accurate.
 
+### Video and audio (EmbeddingGemma 2)
+
+`--modality video|audio` runs the rest of EmbeddingGemma 2 on the GPU, so a corpus run needs no CPU-only stage.
+
+- **Video** follows `EmbeddingGemma2VideoProcessor`, as the CPU runner does:
+  - ffmpeg decodes on the CPU at 1 fps, up to 32 frames (uniform overflow), 140 soft tokens per frame.
+  - Each frame goes through the same GPU resize + vision tower + 3x3 pooler as an image. A clip whose decoded frames
+    exceed the per-batch byte budget is resized on the CPU instead.
+  - The text row is `<|image>` + `<|video|>` x n + `<image|>` per frame.
+- **Audio** follows the Gemma 4 audio tower, a port of the CPU runner's ops:
+  - ffmpeg decodes to 16 kHz mono (first 30 s), and log-mel is computed on the CPU (`src/media.rs`).
+  - Two 3x3 stride-2 subsampling convs, each with a channel LayerNorm + ReLU, feed the input projection.
+  - 12 conformer layers follow, each: FF (x0.5) / chunked attention / light conv / FF (x0.5) / norm. The attention
+    uses 12-frame chunks with 12 frames of left context, relative-position logits and a soft cap of 50. The light conv
+    is a GLU, a causal depthwise conv of width 5, an RMSNorm and SiLU. The clippable linears' bounds are applied.
+  - `output_proj` and the `embed_audio` projection come last.
+  - All of it runs as packed clips with per-stage row maps, one fused kernel per non-GEMM step. The subsampling convs
+    always run in FP32.
+
+Results on one B200 (job limited to 1 CPU core, so video is bound by ffmpeg decoding; the GPU time is shown
+separately). Real PMC media: 120 videos (96 mp4, 18 avi, 4 mov, 2 mpg) and 46 audio recordings. The card runtime is
+sentence-transformers on the same GPU, batch 4; CPU flashembed is the CPU runner (16 cores, EPYC 75F3).
+
+| case | flashembed-gpu items/s (GPU s) | card runtime GPU items/s | CPU flashembed items/s | flashembed-gpu device memory | card runtime peak alloc / reserved |
+|---|---|---|---|---|---|
+| video bf16 | 4.49 (3.3 s for 120) | 1.15 | - | 3.5 GB | 5.2 / 9.3 GB |
+| video fp32 | 3.39 (11.9 s) | 1.03 | 0.10 | 6.1 GB | 9.6 / 19.4 GB |
+| audio bf16 | 77.4 | 9.07 | - | 2.5 GB | 1.5 / 1.8 GB |
+| audio fp32 | 57.6 | 10.6 | 1.57 | 4.3 GB | 2.8 / 3.0 GB |
+
+Audio's device memory is the arena for `--max-frames 12000` (about 10 clips of 30 s per forward); a smaller value
+trades it for throughput.
+
+Parity (cosine, per item):
+
+| set | flashembed-gpu fp32 | flashembed-gpu bf16 |
+|---|---|---|
+| benchmark videos (34) vs CPU card runtime / CPU flashembed (fp32) | min 0.9999999995 | min 0.99988 |
+| real videos (120) vs card runtime GPU fp32 | median 0.99999999998, 2 below 0.999 (min 0.9869), 3 below 0.9999 | same 2 below 0.999 |
+| benchmark audio (40) vs CPU card runtime / CPU flashembed | min 0.99999999 | min 0.99989 |
+| real audio (46) vs card runtime GPU fp32 | min 0.9999997 | min 0.99987 |
+
+The three real videos below 0.9999 are container/decoder effects, not the model:
+- two MPEG-PS `.mpg` files (0.987, 0.989): when torchcodec seeks in these open-GOP streams it drops frames, so the
+  card runtime gets a later frame than the one it asked for (e.g. 0.91 s instead of 0.23 s). flashembed decodes
+  sequentially and gets the requested frame;
+- one DV `.avi` (0.9997): the same frames, colour conversion of 4:1:1 chroma differs by at most 14/255.
+
+Video frame selection, shared with the CPU runner (`src/media.rs`), now reproduces torchcodec's exact mode:
+- packet pts, or dts when the container has none (AVI);
+- seconds as `ts * num / den`;
+- frame i is the first decoded frame whose pts is at or after the i-th smallest packet pts. This uses ffmpeg with
+  `-copyts`, a `select` filter and `showinfo`.
+
+Before this fix, about 5-7 % of real videos (rounded sampling indices, AVI without pts, streams starting at pts 1000)
+got shifted frames, at cos 0.98-0.998 vs the card runtime. That includes CPU-runner vectors built before the fix.
+
+Adding video and audio does not change text or images: their vectors are bit-identical to the previous build, and
+alternating runs on the same inputs give the same speed within noise (text 1,944 vs 1,951 items/s, images 246 vs
+243 items/s, at 1 CPU core).
+
+### Persistent mode (`serve`)
+
+`flashembed-gpu serve` loads the model once and then takes one request per stdin line, for corpus runs that
+embed many small bundles. It uses the same protocol as the CPU runner's `serve`.
+
+```bash
+flashembed-gpu serve --model gemma --snapshot <snapshot> --dtype bf16 --modalities text,image
+# stdout: {"ready": true, "model": "gemma", "modalities": ["text", "image"], "load_s": ..., ...}
+# stdin:  {"id": "b1/text", "modality": "text", "input": "/data/b1/text.jsonl", "out": "/out/b1/text"}
+# stdout: {"id": "b1/text", "ok": true, "items": 5261, "failed": [], "seconds": 2.1, "items_per_s": ..., "out": ...}
+```
+
+- **Outputs:** each request writes the same files as `embed`.
+- **Failures:**
+  - Item-level failures (bad JSON row, undecodable file, too many tokens) are listed in `failed`. The other items are
+    still embedded and written.
+  - A request that can't be read, or embeds nothing, returns `ok: false` with an `error`.
+  - A GPU error fails that batch's items.
+  - The server keeps going after any failure and exits at end of input.
+- **Pipelining:** a preprocessing thread works through the requests in order. It prepares the next request's batches
+  while the GPU runs the current one.
+- **Output parity:** vectors are bit-identical to `embed` on the same inputs.
+
+On 20 real corpus bundles (124,250 text and figure units per model, B200, 8 CPU cores), compared with one `embed`
+process per bundle and modality:
+
+| model | per-bundle `embed` | `serve` | speed-up |
+|---|---|---|---|
+| EmbeddingGemma 2 | 598 items/s (208 s) | 1,376 items/s (90 s) | 2.3x |
+| NeoMME | 657 items/s (189 s) | 1,356 items/s (92 s) | 2.1x |
+
+Startup (load + warm-up) takes 2-3 s and happens once instead of once per invocation.
+
+`FLASHEMBED_ATTN=cudnn` (experimental) in `serve` on the same 20 bundles: EmbeddingGemma 2 1,555-1,665 items/s vs
+1,358-1,381 with the built-in attention (+14-20 %; 66 cuDNN graphs, 4-7 s of graph building per process), NeoMME no
+gain (1,383 vs 1,414-1,427). Vectors vs the built-in bf16 kernels: min cos 0.9953 (EmbeddingGemma 2) / 0.9986
+(NeoMME); vs the card runtime fp32 on the benchmark sets the cuDNN path is as close as the built-in one (min cos
+0.9999 text, 0.9990 figures). It stays opt-in until the per-item outliers are understood.
+
 ## Build and run
 
 ```bash
@@ -177,13 +277,15 @@ Options: `--dtype bf16|fp32`, `--max-tokens` (tokens per forward, default 32768;
 `--max-patches` (image patches per forward), `--max-items`, `--max-len`, `--side document|query` (NeoMME), `--no-late`,
 `--dim` (EmbeddingGemma 2 Matryoshka size), `--warmup`, `--prep-only` (time the CPU preprocessing alone).
 Output files are the same as `flashembed embed`'s, plus `embeddings.json` with throughput and GPU memory.
-Environment: `FLASHEMBED_ATTN=simt` forces the plain SIMT attention kernels; `FLASHEMBED_FP32_GEMM=sgemm` runs FP32
+Environment: `FLASHEMBED_ATTN=simt` forces the plain SIMT attention kernels; `FLASHEMBED_ATTN=cudnn` (experimental,
+needs a build with `FLASHEMBED_CUDNN_INCLUDE` pointing at the cuDNN >= 9.10 and cudnn-frontend headers, and
+`libcudnn.so.9` at run time) uses cuDNN's fused attention for bf16; `FLASHEMBED_FP32_GEMM=sgemm` runs FP32
 GEMMs as plain SGEMM instead of cuBLAS's BF16x9 FP32 emulation (see Precision); `--quant fp8|nvfp4` is described
 above.
 
-Scope: text and images for both models (EmbeddingGemma 2 at the default 280 soft tokens per image). Audio and
-video stay on the CPU runner for now. Video would need the vision tower at 140 tokens per frame; audio would need
-the conformer.
+Scope: text and images for both models (EmbeddingGemma 2 at the default 280 soft tokens per image), and video and
+audio for EmbeddingGemma 2 (`--max-frames`, audio frames per forward, default 12000). Video and audio need `ffmpeg` /
+`ffprobe` (or `FLASHEMBED_FFMPEG` / `FLASHEMBED_FFPROBE`), as on the CPU runner.
 
 ## Design
 
