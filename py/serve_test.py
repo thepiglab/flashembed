@@ -24,6 +24,8 @@ def main():
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--extra", default="")
     ap.add_argument("--dtype", default="bf16")
+    ap.add_argument("--serve-only", action="store_true", help="skip the per-bundle embed pass (speed only)")
+    ap.add_argument("--compare", type=Path, help="with --serve-only: directory of an earlier run's serve/ outputs")
     a = ap.parse_args()
     extra = shlex.split(a.extra)
     tname = "text-neomme.jsonl" if a.model == "neomme" else "text.jsonl"
@@ -37,7 +39,7 @@ def main():
     base = ["--model", a.model, "--snapshot", a.snapshot, "--dtype", a.dtype] + extra
     # per-bundle embed
     t = time.perf_counter()
-    for name, mod, inp, n in jobs:
+    for name, mod, inp, n in ([] if a.serve_only else jobs):
         od = a.out / "embed" / name / mod
         p = subprocess.run([a.bin, "embed", "--modality", mod, "--input", str(inp), "--out", str(od)] + base,
                            capture_output=True, text=True)
@@ -77,13 +79,17 @@ def main():
     ok = [r for r in replies if r.get("ok")]
     bad = [r for r in replies if not r.get("ok")]
     # bit-identical outputs
-    same, diff = 0, []
+    same, diff, mincos = 0, [], 1.0
     for name, mod, inp, n in jobs:
-        e, s = a.out / "embed" / name / mod, a.out / "serve" / name / mod
+        e, s = (a.compare if a.serve_only and a.compare else a.out / "embed") / name / mod, a.out / "serve" / name / mod
         try:
             eq = all(np.array_equal(np.load(e / f), np.load(s / f)) for f in ["embeddings.dense.npy"] +
                      [f for f in ("embeddings.late.npy", "embeddings.late_offsets.npy") if (e / f).exists()])
             eq = eq and json.load(open(e / "embeddings.ids.json")) == json.load(open(s / "embeddings.ids.json"))
+            x, y = np.load(e / "embeddings.dense.npy").astype(np.float64), np.load(s / "embeddings.dense.npy").astype(np.float64)
+            if x.shape == y.shape and len(x):
+                c = (x * y).sum(1) / np.linalg.norm(x, axis=1) / np.linalg.norm(y, axis=1)
+                mincos = min(mincos, float(c.min()))
         except Exception as ex:  # missing output
             eq = False
         same += eq
@@ -95,7 +101,7 @@ def main():
                       "speedup": round(t_embed / t_serve, 2), "ready": ready, "replies_ok": len(ok),
                       "replies_failed": len(bad), "failed_ids": [r.get("id") for r in bad][:5],
                       "failed_errors": [r.get("error", "")[:120] for r in bad][:5],
-                      "bit_identical": same, "not_identical": diff[:10],
+                      "bit_identical": same, "min_cos_vs_reference": mincos, "not_identical": diff[:10],
                       "bad_items_reply": {k: bi.get(k) for k in ("ok", "items", "failed")} if bi else None}))
 
 

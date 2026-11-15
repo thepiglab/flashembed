@@ -258,6 +258,12 @@ process per bundle and modality:
 
 Startup (load + warm-up) takes 2-3 s and happens once instead of once per invocation.
 
+`FLASHEMBED_ATTN=cudnn` (experimental) in `serve` on the same 20 bundles: EmbeddingGemma 2 1,555-1,665 items/s vs
+1,358-1,381 with the built-in attention (+14-20 %; 66 cuDNN graphs, 4-7 s of graph building per process), NeoMME no
+gain (1,383 vs 1,414-1,427). Vectors vs the built-in bf16 kernels: min cos 0.9953 (EmbeddingGemma 2) / 0.9986
+(NeoMME); vs the card runtime fp32 on the benchmark sets the cuDNN path is as close as the built-in one (min cos
+0.9999 text, 0.9990 figures). It stays opt-in until the per-item outliers are understood.
+
 ## Build and run
 
 ```bash
