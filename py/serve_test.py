@@ -23,7 +23,7 @@ def main():
     ap.add_argument("--bundles", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--extra", default="")
-    ap.add_argument("--dtype", default="bf16")
+    ap.add_argument("--dtype", default="bf16", help="'' for the CPU runner (no --dtype option)")
     ap.add_argument("--serve-only", action="store_true", help="skip the per-bundle embed pass (speed only)")
     ap.add_argument("--compare", type=Path, help="with --serve-only: directory of an earlier run's serve/ outputs")
     a = ap.parse_args()
@@ -36,7 +36,7 @@ def main():
                 n = sum(1 for _ in open(b / f))
                 jobs.append((b.name, mod, b / f, n))
     items = sum(j[3] for j in jobs)
-    base = ["--model", a.model, "--snapshot", a.snapshot, "--dtype", a.dtype] + extra
+    base = ["--model", a.model, "--snapshot", a.snapshot] + (["--dtype", a.dtype] if a.dtype else []) + extra
     # per-bundle embed
     t = time.perf_counter()
     for name, mod, inp, n in ([] if a.serve_only else jobs):

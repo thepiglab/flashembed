@@ -44,9 +44,10 @@ the same inputs, nodes and CPUs, over 353 cases measured on both runtimes, on th
 
 ## GPU runner
 
-`flashembed-gpu` (cargo feature `cuda`) is a native CUDA engine for the same two models, text and images. Its fused
-kernels include FlashAttention-style tensor-core attention for bf16 and 3xTF32 for fp32, and GEMMs run on cuBLAS.
-Inputs are packed sequences with no padding.
+`flashembed-gpu` (cargo feature `cuda`) is a native CUDA engine for the same two models. It covers text and images for
+both, plus video and audio for EmbeddingGemma 2. Its fused kernels include FlashAttention-style tensor-core attention
+for bf16 and 3xTF32 for fp32, and GEMMs run on cuBLAS. Inputs are packed sequences with no padding. It has the same
+`embed` / `serve` interface as the CPU runner.
 
 The reference is the runtime each model card documents, run on the same GPU: sentence-transformers 6.3.0 for
 EmbeddingGemma 2 and transformers 5.22.2 `NeoMMEForRetrieval` for NeoMME, on PyTorch 2.15 / CUDA 13.2. Its default
@@ -69,8 +70,25 @@ chunks and 400 figures from PubMed Central. flashembed-gpu produces the same vec
 memory is flashembed-gpu vs reference. bf16 stays at cos >= 0.9999 for text and >= 0.9986 for figures against the
 reference's fp32 vectors, as close as the reference's own bf16 mode.)
 
-It also beats ONNX Runtime's CUDA and TensorRT execution providers on the same graphs. Details, design and
-measurements are in [docs/GPU.md](docs/GPU.md).
+It also beats ONNX Runtime's CUDA and TensorRT execution providers on the same graphs. EmbeddingGemma 2 video runs
+3.3-3.9x faster than the card runtime on the same GPU, and audio 5.4-8.5x. Details, design and measurements are in
+[docs/GPU.md](docs/GPU.md).
+
+### Corpus run (PubMed Central, about 98k articles)
+
+Both models embedded 490 bundles: 401k text units and 49k figures per model, bf16, one GPU. Parity was checked
+against the CPU runner's fp32 vectors of the same corpus.
+
+| run | GPU | wall time | notes |
+|---|---|---|---|
+| one `flashembed-gpu embed` per bundle and modality | B200 | 3.4 h | ~3 s fixed cost per invocation, decode starved at 2 CPUs |
+| one `flashembed-gpu serve` per model | RTX PRO 6000 | 1.6 h | 92 % mean GPU utilisation, 8 CPUs |
+
+- **Text** (both models): GPU bf16 vs CPU fp32 min cos 0.9989, median 0.99999. One EmbeddingGemma 2 text of 401k is
+  below 0.999.
+- **Figures:** median 0.99997. 44 EmbeddingGemma 2 figures of 49k (min 0.9954) and 4 NeoMME figures are below 0.999.
+- **Retrieval:** MRR@10 for title->article, caption->figure and figure->caption differs from the fp32 CPU run by at
+  most 0.0012.
 
 ## What was profiled
 
@@ -150,6 +168,16 @@ writes the same files as `embed` and answers with one stdout line: `{"id": ..., 
 listed in `failed` and left out of the outputs; the server exits at end of input.
 `flashembed bench` runs the benchmark harness; `flash-check` tests the attention kernel against an f64 reference.
 
+`flashembed-gpu` takes the same `embed` / `serve` commands with `--snapshot` and `--dtype bf16|fp32` instead of
+`--onnx` / `--threads` / `--batch`. It packs batches by a token budget (`--max-tokens`), and its `serve` output is
+bit-identical to its `embed` output. One difference: a GPU batch error fails that batch's items instead of retrying them one by
+one. Build: `FLASHEMBED_CUDA_ARCH=100,120 cargo build --release --features cuda --bin flashembed-gpu`, with CUDA >= 12.8
+(see [docs/GPU.md](docs/GPU.md)).
+
+Quantized CPU variants (int8 `q8blk` and others, [docs/QUANTIZATION.md](docs/QUANTIZATION.md)) are opt-in only: they
+are made with `flashembed quantize` into a separate graph directory. The default fp32 graphs and the GPU runner never
+use them, and their retrieval check is still pending.
+
 ### Running the benchmarks on a Slurm cluster
 
 `slurm/*.sbatch` hold no site specifics. Copy `site.env.example` to `local/site.env` (gitignored), set
@@ -178,8 +206,9 @@ anything, and `flashembed_sbatch` (a drop-in for `sbatch`) refuses to submit it.
 
 | path | what |
 |---|---|
-| `src/main.rs` | CLI (`embed`, `bench`), ONNX Runtime sessions, thread-pool autotune, batching, pooling |
-| `cuda/fegpu.cu`, `src/gpu.rs`, `src/bin/flashembed_gpu.rs` | GPU runner: CUDA engine, Rust bindings + weight loading, CLI ([docs/GPU.md](docs/GPU.md)) |
+| `src/main.rs` | CLI (`embed`, `serve`, `bench`), ONNX Runtime sessions, thread-pool autotune, batching, pooling |
+| `cuda/fegpu.cu`, `src/gpu.rs`, `src/bin/flashembed_gpu.rs` | GPU runner: CUDA engine, Rust bindings + weight loading, CLI with `embed` / `serve` ([docs/GPU.md](docs/GPU.md)) |
+| `cuda/fe_cudnn.cpp` | optional cuDNN fused attention for the GPU runner (`FLASHEMBED_ATTN=cudnn`, experimental) |
 | `src/flash.rs` | custom ops: FlashAttention, AudioChunkAttention, ChannelLayerNorm |
 | `src/prep.rs`, `src/pil_resize.rs` | tokenization, EmbeddingGemma 2 / NeoMME image preprocessing, Pillow/ATen-exact resize |
 | `src/media.rs` | FFmpeg audio/video decoding, Gemma 4 log-mel features, video frame sampling |
