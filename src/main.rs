@@ -32,6 +32,8 @@ enum Cmd {
     Embed(EmbedArgs),
     /// Encode the benchmark inputs and record throughput / peak RSS / vectors.
     Bench(BenchArgs),
+    /// Persistent server: load once, then embed one jsonl file per stdin request line (JSON in, JSON out).
+    Serve(ServeArgs),
 }
 
 #[derive(clap::Args)]
@@ -174,7 +176,15 @@ fn oe<T, E: std::fmt::Display>(r: std::result::Result<T, E>) -> Result<T> {
     r.map_err(|e| anyhow!("{e}"))
 }
 
+/// CPUs this process may run on: elsewhere than Linux, all logical CPUs on one "socket".
+#[cfg(not(target_os = "linux"))]
+fn cpu_topology() -> Vec<(usize, String)> {
+    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    (0..n).map(|c| (c, "0".to_string())).collect()
+}
+
 /// CPUs this process may run on (cgroup/cpuset) with their socket ids.
+#[cfg(target_os = "linux")]
 fn cpu_topology() -> Vec<(usize, String)> {
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     let ok = unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) } == 0;
@@ -341,9 +351,14 @@ struct Runner {
     kind: ModelKind,
     modality: Modality,
     tok: tokenizers::Tokenizer,
-    main: Session,
+    /// Gemma: gemma_lm; NeoMME: neomme_text (None when serving NeoMME images only)
+    main: Option<Session>,
+    /// NeoMME image graph
+    nimg: Option<Session>,
+    /// Gemma vision tower used for images (fixed or dynamic patch graph, see `new`)
     vision: Option<Session>,
-    _vision_dyn: bool,
+    /// dynamic-patch vision graph for video frames, when `vision` is the fixed-shape one (else video uses `vision`)
+    vision_vid: Option<Session>,
     audio: Option<Session>,
     mel: media::MelExtractor,
     soft_budget: usize,
@@ -361,23 +376,48 @@ struct Runner {
 }
 
 impl Runner {
-    fn new(a: &BenchArgs, pol: &Policy) -> Result<Self> {
+    /// Load the graphs for `mods` (one runner can serve several modalities; set `modality` before `run`).
+    fn new(a: &BenchArgs, mods: &[Modality], pol: &Policy) -> Result<Self> {
         let env = ort_env()?;
         let tok_path = a.snapshot.join("tokenizer.json");
-        let trunc = if a.modality == Modality::Text { Some(a.max_len) } else { None };
+        // truncation only affects text: multimodal rows are built from ids (wrap_specials encodes "")
+        let trunc = if mods.contains(&Modality::Text) { Some(a.max_len) } else { None };
         let tok = prep::load_tokenizer(&tok_path, trunc)?;
-        let lm = || session(&env, &a.onnx.join("gemma_lm.onnx"), pol);
-        // fixed-shape graph for the 280-token default; dynamic-patch graph for other budgets and video frames
-        let vision_dyn = a.modality == Modality::Video || (a.modality == Modality::Image && (a.max_soft_tokens != prep::G_SOFT || !vision_full()));
-        let vis = || session(&env, &a.onnx.join(if vision_dyn { "gemma_vision_dyn.onnx" } else { "gemma_vision.onnx" }), pol);
-        let (main, vision, audio) = match (a.model, a.modality) {
-            (ModelKind::Gemma, Modality::Text) => (lm()?, None, None),
-            (ModelKind::Gemma, Modality::Image | Modality::Video) => (lm()?, Some(vis()?), None),
-            (ModelKind::Gemma, Modality::Audio) => (lm()?, None, Some(session(&env, &a.onnx.join("gemma_audio.onnx"), pol)?)),
-            (ModelKind::Neomme, Modality::Text) => (session(&env, &a.onnx.join("neomme_text.onnx"), pol)?, None, None),
-            (ModelKind::Neomme, Modality::Image) => (session(&env, &a.onnx.join("neomme_image.onnx"), pol)?, None, None),
-            (ModelKind::Neomme, m) => bail!("NeoMME-260M-Retriever has no {m:?} encoder (text and images only)"),
-        };
+        let has = |m: Modality| mods.contains(&m);
+        let sess = |name: &str| session(&env, &a.onnx.join(name), pol);
+        let (mut main, mut nimg, mut vision, mut vision_vid, mut audio) = (None, None, None, None, None);
+        match a.model {
+            ModelKind::Gemma => {
+                main = Some(sess("gemma_lm.onnx")?);
+                // fixed-shape graph for the 280-token default with FLASHEMBED_VISION_FULL=1; dynamic-patch graph for
+                // other budgets, patch trimming (default) and video frames
+                let img_dyn = a.max_soft_tokens != prep::G_SOFT || !vision_full();
+                if has(Modality::Image) {
+                    vision = Some(sess(if img_dyn { "gemma_vision_dyn.onnx" } else { "gemma_vision.onnx" })?);
+                }
+                if has(Modality::Video) {
+                    if vision.is_none() {
+                        vision = Some(sess("gemma_vision_dyn.onnx")?);
+                    } else if !img_dyn {
+                        vision_vid = Some(sess("gemma_vision_dyn.onnx")?);
+                    }
+                }
+                if has(Modality::Audio) {
+                    audio = Some(sess("gemma_audio.onnx")?);
+                }
+            }
+            ModelKind::Neomme => {
+                if let Some(m) = mods.iter().find(|m| !matches!(m, Modality::Text | Modality::Image)) {
+                    bail!("NeoMME-260M-Retriever has no {m:?} encoder (text and images only)");
+                }
+                if has(Modality::Text) {
+                    main = Some(sess("neomme_text.onnx")?);
+                }
+                if has(Modality::Image) {
+                    nimg = Some(sess("neomme_image.onnx")?);
+                }
+            }
+        }
         let (pad_id, image_id, doc_id, row_id) = match a.model {
             ModelKind::Gemma => (prep::token_id(&tok, "<pad>")?, prep::token_id(&tok, "<|image|>")?, -1, -1),
             ModelKind::Neomme => (
@@ -397,7 +437,7 @@ impl Runner {
             ModelKind::Neomme => (-1, -1),
         };
         Ok(Self {
-            _env: env, kind: a.model, modality: a.modality, tok, main, vision, _vision_dyn: vision_dyn, audio,
+            _env: env, kind: a.model, modality: mods[0], tok, main, nimg, vision, vision_vid, audio,
             mel: media::MelExtractor::new(), soft_budget: a.max_soft_tokens, video_id, audio_id,
             pad_id, image_id, doc_id, row_id, query, no_late: a.no_late, infer_s: 0.0,
         })
@@ -428,7 +468,7 @@ impl Runner {
                 let (ids, mask, s) = prep::pad(&rows, self.pad_id);
                 let b = rows.len();
                 let t = Instant::now();
-                let outs = oe(self.main.run(ort::inputs![
+                let outs = oe(self.main.as_mut().unwrap().run(ort::inputs![
                     "input_ids" => oe(Tensor::from_array(([b, s], ids)))?,
                     "attention_mask" => oe(Tensor::from_array(([b, s], mask.clone())))?,
                 ]))?;
@@ -464,7 +504,7 @@ impl Runner {
             }
         }
         let t = Instant::now();
-        let outs = oe(self.main.run(ort::inputs![
+        let outs = oe(self.main.as_mut().unwrap().run(ort::inputs![
             "input_ids" => oe(Tensor::from_array(([b, s], ids)))?,
             "attention_mask" => oe(Tensor::from_array(([b, s], mask.clone())))?,
             "mm_embeds" => oe(Tensor::from_array(([b, s, H], mm_embeds)))?,
@@ -508,7 +548,10 @@ impl Runner {
             pp.extend_from_slice(&g.positions[..p * 2]);
             nsoft.push(g.n_soft);
         }
-        let vision = self.vision.as_mut().unwrap();
+        let vision = match (&mut self.vision_vid, self.modality) {
+            (Some(v), Modality::Video) => v,
+            _ => self.vision.as_mut().unwrap(),
+        };
         let t = Instant::now();
         let outs = oe(vision.run(ort::inputs![
             "pixel_values" => oe(Tensor::from_array(([b, p, prep::G_PATCH_DIM], pv)))?,
@@ -701,7 +744,7 @@ impl Runner {
         }
         drop(pats);
         let t = Instant::now();
-        let outs = oe(self.main.run(ort::inputs![
+        let outs = oe(self.nimg.as_mut().unwrap().run(ort::inputs![
             "input_ids" => oe(Tensor::from_array(([b, s], ids)))?,
             "attention_mask" => oe(Tensor::from_array(([b, s], mask.clone())))?,
             "position_ids" => oe(Tensor::from_array(([2, b, s], position_ids)))?,
@@ -763,16 +806,33 @@ fn load_items(dir: &Path, modality: Modality, n: usize, a: &BenchArgs) -> Result
     Ok((ids, items))
 }
 
-fn bench(a: BenchArgs) -> Result<()> {
+fn check_dim(a: &BenchArgs) -> Result<()> {
     if let Some(d) = a.dim {
         if a.model != ModelKind::Gemma || ![128, 256, 512, 768].contains(&d) {
             bail!("--dim is EmbeddingGemma 2's Matryoshka size: 768, 512, 256 or 128");
         }
     }
-    let t_load = Instant::now();
-    let (ids, items) = load_items(&a.inputs, a.modality, a.n, &a)?;
-    // Thread-pool policy autotune: time the first batch under each candidate (one runner alive at a time) and keep
-    // the fastest. Also on one socket: on shared nodes spinning threads lost 1.5-2x to pinned non-spinning ones.
+    Ok(())
+}
+
+fn modality_name(m: Modality) -> &'static str {
+    match m { Modality::Text => "text", Modality::Image => "image", Modality::Audio => "audio", Modality::Video => "video" }
+}
+
+/// Size key for length-sorted batching and for picking the tuning batch.
+fn item_size(it: &Item, for_tuning: bool) -> usize {
+    match it {
+        Item::Text(t) => t.chars().count(),
+        Item::Image(im) => (im.width() * im.height()) as usize,
+        Item::ImagePath(p) if for_tuning => image::image_dimensions(p).map(|(w, h)| (w * h) as usize).unwrap_or(0),
+        Item::Audio(p) | Item::Video(p) if for_tuning => std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Thread-pool policy: FLASHEMBED_ORT_POLICY, or autotune over the non-spinning candidates by timing `tune` (one runner
+/// alive at a time) and keeping the fastest. `tune` = None: no timing, take "pinned" (else the first candidate).
+fn pick_policy(a: &BenchArgs, mods: &[Modality], tune: Option<(Modality, Vec<&Item>)>) -> Result<(Policy, Vec<serde_json::Value>)> {
     let forced = std::env::var("FLASHEMBED_ORT_POLICY").unwrap_or_else(|_| "auto".into());
     let all = policies(a.threads);
     let cands: Vec<Policy> = if forced != "auto" {
@@ -786,104 +846,92 @@ fn bench(a: BenchArgs) -> Result<()> {
     if cands.is_empty() {
         bail!("FLASHEMBED_ORT_POLICY={forced}: no such policy (have {:?})", all.iter().map(|p| &p.name).collect::<Vec<_>>());
     }
-    let tune_first: Vec<&Item> = {
-        // the first batch, in the order the timed pass will see it (longest first)
-        let key = |it: &Item| -> usize {
-            match it {
-                Item::Text(t) => t.chars().count(),
-                Item::Image(im) => (im.width() * im.height()) as usize,
-                Item::ImagePath(p) => image::image_dimensions(p).map(|(w, h)| (w * h) as usize).unwrap_or(0),
-                Item::Audio(p) | Item::Video(p) => std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0),
-            }
-        };
-        // tune on the largest batch (longest texts / largest images): it dominates the run time, and a small first
-        // item picked too few threads for the rest (8 of 16 CPUs on a 9-item image set: 0.87x instead of 1.35x)
-        let mut o: Vec<usize> = (0..items.len()).collect();
-        o.sort_by_key(|&i| std::cmp::Reverse(key(&items[i])));
-        o.iter().take(a.batch).map(|&i| &items[i]).collect()
-    };
     let mut tuning = vec![];
     let mut best: Option<(f64, Policy)> = None;
-    if cands.len() > 1 {
-        for p in &cands {
-            let mut r = Runner::new(&a, p)?;
-            r.run(&tune_first)?;
-            // best of up to 3 timed runs within ~1 s (one run for long inputs): busy nodes are noisy
-            let (mut dt, t_c) = (f64::MAX, Instant::now());
-            for _ in 0..3 {
-                let t = Instant::now();
-                r.run(&tune_first)?;
-                dt = dt.min(t.elapsed().as_secs_f64());
-                if t_c.elapsed().as_secs_f64() > 1.0 {
-                    break;
+    match tune {
+        Some((m, batch)) if cands.len() > 1 && !batch.is_empty() => {
+            for p in &cands {
+                let mut r = Runner::new(a, mods, p)?;
+                r.modality = m;
+                r.run(&batch)?;
+                // best of up to 3 timed runs within ~1 s (one run for long inputs): busy nodes are noisy
+                let (mut dt, t_c) = (f64::MAX, Instant::now());
+                for _ in 0..3 {
+                    let t = Instant::now();
+                    r.run(&batch)?;
+                    dt = dt.min(t.elapsed().as_secs_f64());
+                    if t_c.elapsed().as_secs_f64() > 1.0 {
+                        break;
+                    }
+                }
+                // Spinning pools are fast in a short tuning window but collapse when a shared node's load shifts
+                // (seen: 0.15 s/item while tuning, 0.40 s/item in the timed loop); take one only if >15% faster.
+                let spins = !p.cfg.iter().any(|(k, v)| k == "session.intra_op.allow_spinning" && v == "0");
+                let score = if spins { dt * 1.15 } else { dt };
+                tuning.push(json!({"policy": p.name, "threads": p.threads, "s": dt, "score": score}));
+                if best.as_ref().is_none_or(|b| score < b.0) {
+                    best = Some((score, p.clone()));
                 }
             }
-            // Spinning pools are fast in a short tuning window but collapse when a shared node's load shifts
-            // (seen: 0.15 s/item while tuning, 0.40 s/item in the timed loop); take one only if >15% faster.
-            let spins = !p.cfg.iter().any(|(k, v)| k == "session.intra_op.allow_spinning" && v == "0");
-            let score = if spins { dt * 1.15 } else { dt };
-            tuning.push(json!({"policy": p.name, "threads": p.threads, "s": dt, "score": score}));
-            if best.as_ref().is_none_or(|b| score < b.0) {
-                best = Some((score, p.clone()));
-            }
         }
+        _ => {}
     }
-    let pol = best.map(|b| b.1).unwrap_or_else(|| cands[0].clone());
-    let mut r = Runner::new(&a, &pol)?;
-    let load_s = t_load.elapsed().as_secs_f64();
+    let pol = best.map(|b| b.1).unwrap_or_else(|| {
+        cands.iter().find(|p| p.name.starts_with("pinned")).cloned().unwrap_or_else(|| cands[0].clone())
+    });
+    Ok((pol, tuning))
+}
+
+/// Embed `items` with `r` (modality already set) and write the outputs like `embed`/`bench`.
+/// tolerant (serve): a failing batch is retried item by item; items that still fail are left out of the outputs and
+/// returned as (id, error). Otherwise the first error is returned.
+fn embed_run(r: &mut Runner, a: &BenchArgs, ids: &[String], items: &[Item], load_s: f64, pol: &Policy,
+             tuning: &[serde_json::Value], tolerant: bool, extra: serde_json::Value)
+             -> Result<(serde_json::Value, usize, Vec<(String, String)>)> {
     // Length-sorted batching (longest first), as sentence-transformers does: less padding, same per-item vectors.
     // Outputs are put back into input order before saving.
-    let key = |it: &Item| -> usize {
-        match it {
-            Item::Text(t) => t.chars().count(),
-            Item::Image(im) => (im.width() * im.height()) as usize,
-            _ => 0,
-        }
-    };
     let mut order: Vec<usize> = (0..items.len()).collect();
     if a.batch > 1 && !a.no_sort {
-        order.sort_by_key(|&i| std::cmp::Reverse(key(&items[i])));
+        order.sort_by_key(|&i| std::cmp::Reverse(item_size(&items[i], false)));
     }
-    let refs: Vec<&Item> = order.iter().map(|&i| &items[i]).collect();
-    let batches: Vec<&[&Item]> = refs.chunks(a.batch).collect();
-    for b in batches.iter().take(a.warmup) {
-        r.run(b)?;
+    let chunks: Vec<&[usize]> = order.chunks(a.batch.max(1)).collect();
+    for c in chunks.iter().take(a.warmup) {
+        let b: Vec<&Item> = c.iter().map(|&i| &items[i]).collect();
+        r.run(&b)?;
     }
     r.infer_s = 0.0;
-    let mut outs = Vec::with_capacity(batches.len());
-    let mut lat = Vec::with_capacity(batches.len());
+    // per item: (input index, dense, late, late rows)
+    let mut per: Vec<(usize, Vec<f32>, Vec<f32>, usize)> = Vec::with_capacity(items.len());
+    let mut failed: Vec<(String, String)> = vec![];
+    let mut lat = Vec::with_capacity(chunks.len());
+    let mut ntok = 0usize;
+    let mut push = |o: BatchOut, idx: &[usize], per: &mut Vec<(usize, Vec<f32>, Vec<f32>, usize)>| {
+        ntok += o.ntok;
+        for (j, dv) in o.dense.into_iter().enumerate() {
+            let (lv, lr) = if o.late.is_empty() { (vec![], 0) } else { (o.late[j].clone(), o.late_rows[j]) };
+            per.push((idx[j], dv, lv, lr));
+        }
+    };
     let t0 = Instant::now();
-    for b in &batches {
+    for c in &chunks {
         let s = Instant::now();
-        outs.push(r.run(b)?);
+        let b: Vec<&Item> = c.iter().map(|&i| &items[i]).collect();
+        match r.run(&b) {
+            Ok(o) => push(o, c, &mut per),
+            Err(e) if !tolerant => return Err(e),
+            Err(e) if c.len() == 1 => failed.push((ids[c[0]].clone(), format!("{e:#}"))),
+            Err(_) => {
+                for &i in c.iter() {
+                    match r.run(&[&items[i]]) {
+                        Ok(o) => push(o, &[i], &mut per),
+                        Err(e) => failed.push((ids[i].clone(), format!("{e:#}"))),
+                    }
+                }
+            }
+        }
         lat.push(s.elapsed().as_secs_f64());
     }
     let wall = t0.elapsed().as_secs_f64();
-    let model = match a.model { ModelKind::Gemma => "gemma", ModelKind::Neomme => "neomme" };
-    let modality = match a.modality { Modality::Text => "text", Modality::Image => "image", Modality::Audio => "audio", Modality::Video => "video" };
-    let tag = if a.plain_names { "embeddings".to_string() } else { format!("rs-{model}-{modality}-t{}-b{}{}", a.threads, a.batch, a.tag_suffix) };
-    let ntok: usize = outs.iter().map(|o| o.ntok).sum();
-    let res = json!({
-        "tag": tag, "runtime": "rust-ort", "model": model, "modality": modality, "threads": a.threads,
-        "batch": a.batch, "dim": a.dim, "no_late": a.no_late, "n": items.len(), "warmup_batches": a.warmup, "wall_s": wall,
-        "items_per_s": items.len() as f64 / wall, "batch_latency_s": lat, "load_s": load_s,
-        "peak_rss_mb": peak_rss_mb(), "tokens_total": ntok, "dtype": "float32",
-        "infer_s": r.infer_s, "prep_post_s": wall - r.infer_s, "side": a.side, "texts_file": a.texts_file,
-        "ort": "load-dynamic (ORT_DYLIB_PATH)", "ort_arena": std::env::var("FLASHEMBED_ORT_ARENA").is_ok_and(|v| v == "1"), "ort_thread_policy": pol.name, "ort_intra_threads": pol.threads, "policy_tuning": tuning, "ort_config": std::env::var("FLASHEMBED_ORT_CONFIG").unwrap_or_default(), "ort_dylib": std::env::var("ORT_DYLIB_PATH").unwrap_or_default(),
-        "cpu": cpu_model(), "host": std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim(),
-        "job": std::env::var("SLURM_JOB_ID").ok(),
-    });
-    std::fs::create_dir_all(&a.out)?;
-    // un-sort: per-item results back to input order
-    let mut per: Vec<(usize, Vec<f32>, Vec<f32>, usize)> = Vec::with_capacity(items.len());
-    let mut k = 0;
-    for o in &outs {
-        for (j, dv) in o.dense.iter().enumerate() {
-            let (lv, lr) = if o.late.is_empty() { (vec![], 0) } else { (o.late[j].clone(), o.late_rows[j]) };
-            per.push((order[k], dv.clone(), lv, lr));
-            k += 1;
-        }
-    }
     per.sort_by_key(|x| x.0);
     if let Some(d) = a.dim {
         // Matryoshka: keep the leading d dims of the (already normalised) vector, then re-normalise
@@ -892,35 +940,237 @@ fn bench(a: BenchArgs) -> Result<()> {
             l2_normalize(&mut x.1);
         }
     }
-    let outs = vec![BatchOut {
-        dense: per.iter().map(|x| x.1.clone()).collect(),
-        late: if outs[0].late.is_empty() { vec![] } else { per.iter().map(|x| x.2.clone()).collect() },
-        late_rows: per.iter().map(|x| x.3).collect(),
-        ntok: ntok,
-    }];
-    if a.save {
-        let d = outs[0].dense[0].len();
-        let flat: Vec<f32> = outs.iter().flat_map(|o| o.dense.iter().flatten().copied()).collect();
-        ndarray_npy::write_npy(a.out.join(format!("{tag}.dense.npy")), &Array2::from_shape_vec((items.len(), d), flat)?)?;
-        if !outs[0].late.is_empty() {
-            let late: Vec<f32> = outs.iter().flat_map(|o| o.late.iter().flatten().copied()).collect();
+    let model = match a.model { ModelKind::Gemma => "gemma", ModelKind::Neomme => "neomme" };
+    let modality = modality_name(r.modality);
+    let tag = if a.plain_names { "embeddings".to_string() } else { format!("rs-{model}-{modality}-t{}-b{}{}", a.threads, a.batch, a.tag_suffix) };
+    let mut res = json!({
+        "tag": tag, "runtime": "rust-ort", "model": model, "modality": modality, "threads": a.threads,
+        "batch": a.batch, "dim": a.dim, "no_late": a.no_late, "n": per.len(), "failed": failed.len(), "warmup_batches": a.warmup, "wall_s": wall,
+        "items_per_s": per.len() as f64 / wall, "batch_latency_s": lat, "load_s": load_s,
+        "peak_rss_mb": peak_rss_mb(), "tokens_total": ntok, "dtype": "float32",
+        "infer_s": r.infer_s, "prep_post_s": wall - r.infer_s, "side": a.side, "texts_file": a.texts_file,
+        "ort": "load-dynamic (ORT_DYLIB_PATH)", "ort_arena": std::env::var("FLASHEMBED_ORT_ARENA").is_ok_and(|v| v == "1"), "ort_thread_policy": pol.name, "ort_intra_threads": pol.threads, "policy_tuning": tuning, "ort_config": std::env::var("FLASHEMBED_ORT_CONFIG").unwrap_or_default(), "ort_dylib": std::env::var("ORT_DYLIB_PATH").unwrap_or_default(),
+        "cpu": cpu_model(), "host": std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim(),
+        "job": std::env::var("SLURM_JOB_ID").ok(),
+    });
+    if let (Some(o), Some(x)) = (res.as_object_mut(), extra.as_object()) {
+        o.extend(x.clone());
+    }
+    std::fs::create_dir_all(&a.out)?;
+    if a.save && !per.is_empty() {
+        let d = per[0].1.len();
+        let flat: Vec<f32> = per.iter().flat_map(|x| x.1.iter().copied()).collect();
+        ndarray_npy::write_npy(a.out.join(format!("{tag}.dense.npy")), &Array2::from_shape_vec((per.len(), d), flat)?)?;
+        if per.iter().any(|x| x.3 > 0) {
+            let late: Vec<f32> = per.iter().flat_map(|x| x.2.iter().copied()).collect();
             let mut offs = vec![0i64];
-            for o in &outs {
-                for &n in &o.late_rows {
-                    offs.push(offs.last().unwrap() + n as i64);
-                }
+            for x in &per {
+                offs.push(offs.last().unwrap() + x.3 as i64);
             }
             let rows = *offs.last().unwrap() as usize;
             ndarray_npy::write_npy(a.out.join(format!("{tag}.late.npy")), &Array2::from_shape_vec((rows, late.len() / rows), late)?)?;
             ndarray_npy::write_npy(a.out.join(format!("{tag}.late_offsets.npy")), &Array1::from_vec(offs))?;
         }
-        std::fs::write(a.out.join(format!("{tag}.ids.json")), serde_json::to_string(&ids)?)?;
+        let out_ids: Vec<&String> = per.iter().map(|x| &ids[x.0]).collect();
+        std::fs::write(a.out.join(format!("{tag}.ids.json")), serde_json::to_string(&out_ids)?)?;
     }
     std::fs::write(a.out.join(format!("{tag}.json")), serde_json::to_string_pretty(&res)?)?;
-    let mut brief = res.clone();
-    brief.as_object_mut().unwrap().remove("batch_latency_s");
+    res.as_object_mut().unwrap().remove("batch_latency_s");
+    Ok((res, per.len(), failed))
+}
+
+fn bench(a: BenchArgs) -> Result<()> {
+    check_dim(&a)?;
+    let t_load = Instant::now();
+    let (ids, items) = load_items(&a.inputs, a.modality, a.n, &a)?;
+    // tune on the largest batch (longest texts / largest images): it dominates the run time, and a small first
+    // item picked too few threads for the rest (8 of 16 CPUs on a 9-item image set: 0.87x instead of 1.35x)
+    let mut o: Vec<usize> = (0..items.len()).collect();
+    o.sort_by_key(|&i| std::cmp::Reverse(item_size(&items[i], true)));
+    let tune: Vec<&Item> = o.iter().take(a.batch).map(|&i| &items[i]).collect();
+    let (pol, tuning) = pick_policy(&a, &[a.modality], Some((a.modality, tune)))?;
+    let mut r = Runner::new(&a, &[a.modality], &pol)?;
+    let load_s = t_load.elapsed().as_secs_f64();
+    let (brief, _, _) = embed_run(&mut r, &a, &ids, &items, load_s, &pol, &tuning, false, json!({}))?;
     println!("{brief}");
     Ok(())
+}
+
+#[derive(clap::Args)]
+struct ServeArgs {
+    #[arg(long, value_enum)]
+    model: ModelKind,
+    /// directory with the exported ONNX graphs (py/export_onnx.py)
+    #[arg(long)]
+    onnx: PathBuf,
+    /// local Hugging Face snapshot of the model (tokenizer and configs)
+    #[arg(long)]
+    snapshot: PathBuf,
+    /// modalities to load, comma-separated (text,image,video,audio; NeoMME: text,image)
+    #[arg(long, default_value = "text")]
+    modalities: String,
+    #[arg(long)]
+    threads: Option<usize>,
+    #[arg(long, default_value_t = 8)]
+    batch: usize,
+    /// token limit for text (default: the model's maximum)
+    #[arg(long)]
+    max_len: Option<usize>,
+    #[arg(long, default_value = "document")]
+    side: String,
+    #[arg(long, default_value_t = 280)]
+    max_soft_tokens: usize,
+    #[arg(long)]
+    dim: Option<usize>,
+    #[arg(long)]
+    no_late: bool,
+}
+
+/// Persistent server: load graphs and pick the thread pool once, then embed one request per stdin line.
+///   request : {"id": <any>, "modality": "text|image|video|audio", "input": "/path/items.jsonl", "out": "/path/dir"}
+///   response: {"id", "ok": true, "items", "failed": [{"id", "error"}], "seconds", ...} or {"id", "ok": false, "error"}
+/// Writes the same files as `embed`. stdout carries only protocol lines; logs go to stderr. Exits at EOF.
+fn serve(s: ServeArgs) -> Result<()> {
+    use std::io::{BufRead, Write};
+    let t_start = Instant::now();
+    let mut mods: Vec<Modality> = vec![];
+    for m in s.modalities.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+        let m = Modality::from_str(m, true).map_err(|e| anyhow!("--modalities {m}: {e}"))?;
+        if !mods.contains(&m) {
+            mods.push(m);
+        }
+    }
+    if mods.is_empty() {
+        bail!("--modalities: none given");
+    }
+    let threads = s.threads.unwrap_or_else(|| cpu_topology().len().max(1));
+    let max_len = s.max_len.unwrap_or(match s.model { ModelKind::Gemma => 8192, ModelKind::Neomme => 16384 });
+    let base = BenchArgs {
+        model: s.model, modality: mods[0], threads, batch: s.batch.max(1), n: usize::MAX, warmup: 0, max_len,
+        inputs: PathBuf::from("."), onnx: s.onnx, snapshot: s.snapshot, out: PathBuf::from("."), save: true,
+        texts_file: String::new(), images_file: String::new(), side: s.side, tag_suffix: String::new(),
+        max_soft_tokens: s.max_soft_tokens, decode_in_loop: true, no_sort: false, plain_names: true, dim: s.dim,
+        no_late: s.no_late,
+    };
+    check_dim(&base)?;
+    // synthetic tuning / warm-up batch: full-length texts if text is served, else large images
+    let long_text = "The quick brown fox jumps over the lazy dog while the committee reviews the findings. "
+        .repeat(max_len / 12 + 2);
+    let synth_img = RgbImage::from_fn(1024, 1024, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8]));
+    let tune_items: Vec<Item> = if mods.contains(&Modality::Text) {
+        (0..base.batch).map(|_| Item::Text(long_text.clone())).collect()
+    } else if mods.contains(&Modality::Image) {
+        (0..base.batch).map(|_| Item::Image(synth_img.clone())).collect()
+    } else {
+        vec![]
+    };
+    let tune_mod = if mods.contains(&Modality::Text) { Modality::Text } else { Modality::Image };
+    let tune = if tune_items.is_empty() { None } else { Some((tune_mod, tune_items.iter().collect::<Vec<_>>())) };
+    let (pol, tuning) = pick_policy(&base, &mods, tune)?;
+    let mut r = Runner::new(&base, &mods, &pol)?;
+    // warm up each text/image path once (first runs allocate and plan); outputs are discarded
+    for &m in &mods {
+        let w = match m {
+            Modality::Text => Item::Text("warm up".into()),
+            Modality::Image => Item::Image(RgbImage::from_pixel(256, 256, image::Rgb([128, 128, 128]))),
+            _ => continue,
+        };
+        r.modality = m;
+        r.run(&[&w])?;
+    }
+    let load_s = t_start.elapsed().as_secs_f64();
+    let model = match base.model { ModelKind::Gemma => "gemma", ModelKind::Neomme => "neomme" };
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{}", json!({
+        "ready": true, "model": model, "modalities": mods.iter().map(|&m| modality_name(m)).collect::<Vec<_>>(),
+        "threads": threads, "batch": base.batch, "max_len": max_len, "side": base.side, "dim": base.dim,
+        "no_late": base.no_late, "ort_thread_policy": pol.name, "ort_intra_threads": pol.threads,
+        "policy_tuning": tuning, "load_s": load_s, "peak_rss_mb": peak_rss_mb(), "pid": std::process::id(),
+    }))?;
+    out.flush()?;
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let t = Instant::now();
+        let mut rid = serde_json::Value::Null;
+        let res: Result<serde_json::Value> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<serde_json::Value> {
+            let req: serde_json::Value = serde_json::from_str(&line).context("request is not JSON")?;
+            rid = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            let ms = req.get("modality").and_then(|v| v.as_str()).context("request needs \"modality\"")?;
+            let m = Modality::from_str(ms, true).map_err(|e| anyhow!("modality {ms}: {e}"))?;
+            if !mods.contains(&m) {
+                bail!("modality {ms} not loaded (server has {})", s.modalities);
+            }
+            let input = PathBuf::from(req.get("input").and_then(|v| v.as_str()).context("request needs \"input\"")?);
+            let outdir = PathBuf::from(req.get("out").and_then(|v| v.as_str()).context("request needs \"out\"")?);
+            let dir = input.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+            // rows: bad lines are reported per item, not fatal
+            let text = std::fs::read_to_string(&input).with_context(|| format!("read {}", input.display()))?;
+            let key = if m == Modality::Text { "text" } else { "path" };
+            let (mut ids, mut items, mut bad) = (vec![], vec![], vec![]);
+            for (ln, l) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+                let v: serde_json::Value = match serde_json::from_str(l) {
+                    Ok(v) => v,
+                    Err(e) => { bad.push((format!("line {}", ln + 1), format!("bad JSON: {e}"))); continue; }
+                };
+                let id = match &v["id"] { serde_json::Value::String(x) => x.clone(), serde_json::Value::Null => String::new(), x => x.to_string() };
+                let Some(x) = v[key].as_str() else { bad.push((id, format!("missing \"{key}\""))); continue; };
+                ids.push(id);
+                items.push(match m {
+                    Modality::Text => Item::Text(x.to_string()),
+                    Modality::Image => Item::ImagePath(dir.join(x)),
+                    Modality::Audio => Item::Audio(dir.join(x)),
+                    Modality::Video => Item::Video(dir.join(x)),
+                });
+            }
+            let load_req = t.elapsed().as_secs_f64();
+            r.modality = m;
+            let mut a = base.clone_for(m, &dir, &input, &outdir);
+            a.plain_names = true;
+            let (_, n, mut failed) = if items.is_empty() {
+                (json!({}), 0, vec![])
+            } else {
+                embed_run(&mut r, &a, &ids, &items, load_req, &pol, &tuning, true,
+                          json!({"server_load_s": load_s, "request_id": rid.clone()}))?
+            };
+            failed.extend(bad);
+            if n == 0 {
+                bail!("no items embedded ({} failed{})", failed.len(),
+                      failed.first().map(|f| format!(", first: {}: {}", f.0, f.1)).unwrap_or_default());
+            }
+            let secs = t.elapsed().as_secs_f64();
+            Ok(json!({"id": rid.clone(), "ok": true, "items": n, "failed": failed.iter().map(|f| json!({"id": f.0, "error": f.1})).collect::<Vec<_>>(),
+                      "seconds": secs, "items_per_s": n as f64 / secs, "out": outdir, "peak_rss_mb": peak_rss_mb()}))
+        }))
+        .unwrap_or_else(|p| {
+            let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+            Err(anyhow!("panic: {msg}"))
+        });
+        let resp = match res {
+            Ok(v) => v,
+            Err(e) => json!({"id": rid, "ok": false, "error": format!("{e:#}"), "seconds": t.elapsed().as_secs_f64()}),
+        };
+        writeln!(out, "{resp}")?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+impl BenchArgs {
+    /// Per-request copy of the server's settings.
+    fn clone_for(&self, m: Modality, dir: &Path, input: &Path, out: &Path) -> BenchArgs {
+        let file = input.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        BenchArgs {
+            model: self.model, modality: m, threads: self.threads, batch: self.batch, n: usize::MAX, warmup: 0,
+            max_len: self.max_len, inputs: dir.to_path_buf(), onnx: self.onnx.clone(), snapshot: self.snapshot.clone(),
+            out: out.to_path_buf(), save: true, texts_file: file.clone(), images_file: file, side: self.side.clone(),
+            tag_suffix: String::new(), max_soft_tokens: self.max_soft_tokens, decode_in_loop: true, no_sort: false,
+            plain_names: true, dim: self.dim, no_late: self.no_late,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -930,5 +1180,6 @@ fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Embed(a) => bench(a.into_bench()?),
         Cmd::Bench(a) => bench(a),
+        Cmd::Serve(s) => serve(s),
     }
 }
